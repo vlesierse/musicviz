@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Spooky Visuals 🎃</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎃</text></svg>" />
+  </head>
+  <body>
+    <canvas id="stage"></canvas>
+
+    <section id="start" class="overlay">
+      <div class="panel">
+        <h1>Spooky Visuals</h1>
+        <p class="tagline">Twenty haunted visuals that dance to whatever your laptop is playing.</p>
+        <button id="start-btn" type="button">Summon the visuals</button>
+        <ol class="howto">
+          <li>Click the button above.</li>
+          <li>In Chrome's sharing dialog pick <b>Entire screen</b> and switch on <b>Also share system audio</b>.</li>
+          <li>Click <b>Share</b>, start your music, and press <kbd>F</kbd> for fullscreen.</li>
+        </ol>
+        <p id="start-error" class="error" hidden></p>
+        <p class="keys">
+          <kbd>1</kbd>–<kbd>0</kbd> pick visual 1–10 · <kbd>Shift</kbd>+<kbd>1</kbd>–<kbd>0</kbd> visual 11–20 · <kbd>←</kbd>/<kbd>→</kbd> previous / next · <kbd>Space</kbd> pause auto-switch ·
+          <kbd>F</kbd> fullscreen · <kbd>H</kbd> hide overlay
+        </p>
+        <p class="fineprint">Needs Google Chrome 141+ on macOS 14.2+ (or Chrome / Edge on Windows). Audio never leaves your laptop.</p>
+      </div>
+    </section>
+
+    <div id="toast" aria-live="polite"></div>
+
+    <footer id="hud" hidden>
+      <span id="hud-name"></span>
+      <span id="hud-auto"></span>
+      <span id="hud-meter"><i></i><i></i><i></i></span>
+      <span id="hud-fps"></span>
+    </footer>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,215 @@
+@import '@fontsource/creepster/400.css';
+
+:root {
+  --pumpkin: #ff6a00;
+  --toxic: #39ff14;
+  --purple: #8a2be2;
+  --bone: #f2e8cf;
+  --night: #05010a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--night);
+  color: var(--bone);
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+body.hide-cursor {
+  cursor: none;
+}
+
+#stage {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: radial-gradient(ellipse at center, rgba(5, 1, 10, 0.35), rgba(5, 1, 10, 0.85));
+  transition: opacity 0.6s ease;
+  z-index: 10;
+}
+
+.overlay.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.panel {
+  max-width: 40rem;
+  padding: 2.5rem 3rem;
+  text-align: center;
+  background: rgba(10, 3, 18, 0.72);
+  border: 1px solid rgba(255, 106, 0, 0.35);
+  border-radius: 1.25rem;
+  box-shadow: 0 0 80px rgba(138, 43, 226, 0.35), inset 0 0 40px rgba(255, 106, 0, 0.08);
+  backdrop-filter: blur(6px);
+}
+
+h1 {
+  margin: 0 0 0.25rem;
+  font-family: Creepster, Impact, sans-serif;
+  font-weight: 400;
+  font-size: clamp(3rem, 8vw, 5.5rem);
+  letter-spacing: 0.04em;
+  color: var(--pumpkin);
+  text-shadow: 0 0 18px rgba(255, 106, 0, 0.8), 0 0 40px rgba(138, 43, 226, 0.6);
+}
+
+.tagline {
+  margin: 0 0 1.75rem;
+  opacity: 0.85;
+}
+
+#start-btn {
+  font: inherit;
+  font-family: Creepster, Impact, sans-serif;
+  font-size: 1.9rem;
+  letter-spacing: 0.06em;
+  padding: 0.7rem 2.2rem;
+  color: var(--night);
+  background: linear-gradient(180deg, #ff9a3c, var(--pumpkin));
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  box-shadow: 0 0 30px rgba(255, 106, 0, 0.7);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+#start-btn:hover,
+#start-btn:focus-visible {
+  transform: scale(1.05);
+  box-shadow: 0 0 50px rgba(255, 106, 0, 0.95);
+  outline: none;
+}
+
+#start-btn:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.howto {
+  text-align: left;
+  margin: 1.75rem auto 0;
+  max-width: 30rem;
+  line-height: 1.6;
+}
+
+.error {
+  margin: 1.25rem 0 0;
+  padding: 0.75rem 1rem;
+  border-radius: 0.6rem;
+  color: #ffd7d7;
+  background: rgba(179, 0, 27, 0.35);
+  border: 1px solid rgba(255, 60, 80, 0.5);
+}
+
+.keys,
+.fineprint {
+  margin: 1.25rem 0 0;
+  font-size: 0.85rem;
+  opacity: 0.7;
+  line-height: 1.8;
+}
+
+.fineprint {
+  margin-top: 0.5rem;
+  font-size: 0.75rem;
+  opacity: 0.5;
+}
+
+kbd {
+  display: inline-block;
+  min-width: 1.5em;
+  padding: 0 0.35em;
+  font: 0.8em ui-monospace, monospace;
+  border: 1px solid rgba(242, 232, 207, 0.4);
+  border-bottom-width: 2px;
+  border-radius: 0.3em;
+}
+
+#toast {
+  position: fixed;
+  left: 50%;
+  bottom: 12%;
+  transform: translateX(-50%);
+  font-family: Creepster, Impact, sans-serif;
+  font-size: clamp(2rem, 5vw, 4rem);
+  letter-spacing: 0.05em;
+  color: var(--pumpkin);
+  text-shadow: 0 0 20px rgba(255, 106, 0, 0.9), 0 0 50px rgba(138, 43, 226, 0.7);
+  opacity: 0;
+  transition: opacity 0.8s ease;
+  pointer-events: none;
+  white-space: nowrap;
+  z-index: 5;
+}
+
+#toast.show {
+  opacity: 1;
+}
+
+#hud {
+  position: fixed;
+  left: 1rem;
+  bottom: 1rem;
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  padding: 0.4rem 0.9rem;
+  font-size: 0.8rem;
+  background: rgba(5, 1, 10, 0.55);
+  border-radius: 999px;
+  transition: opacity 0.6s ease;
+  z-index: 6;
+}
+
+#hud.idle {
+  opacity: 0;
+}
+
+#hud-auto.paused {
+  color: var(--pumpkin);
+}
+
+#hud-meter {
+  display: inline-flex;
+  gap: 3px;
+  align-items: flex-end;
+  height: 14px;
+}
+
+#hud-meter i {
+  width: 5px;
+  height: 100%;
+  background: var(--toxic);
+  transform-origin: bottom;
+  transform: scaleY(0);
+}
+
+#hud-meter i:nth-child(2) {
+  background: var(--pumpkin);
+}
+
+#hud-meter i:nth-child(3) {
+  background: var(--purple);
+}
+
+#hud-fps {
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
+}
