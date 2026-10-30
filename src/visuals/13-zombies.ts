@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import type { AudioFeatures } from '../audio/features';
 import { GLSL_NOISE } from '../core/glsl';
-import { PALETTE, glslColor } from '../core/palette';
+import { PALETTE } from '../core/palette';
 import { Visual, damp, fullscreenQuad } from '../core/Visual';
 
 const ZOMBIES = 150;
@@ -11,8 +11,17 @@ const DIRT = 700;
 const NEAR_Z = 5;
 const FAR_Z = -72;
 const CAM_Z = 9;
+const MOTES = 160;
 const FOG_COLOR = new THREE.Color(0.035, 0.075, 0.042);
-const MOON_COLOR = PALETTE.moon.clone().lerp(PALETTE.toxic, 0.3);
+const EYE_BANDS = [3, 8, 14, 20, 28, 36, 44, 52];
+/** [glow (eyes, toxic lights, sparks), fog, rim light] — cycles every 32 beats, snaps on drops. */
+const MOODS: Array<[THREE.Color, THREE.Color, THREE.Color]> = [
+  [PALETTE.toxic.clone(), FOG_COLOR.clone(), new THREE.Color(0.42, 0.75, 0.38)],
+  [new THREE.Color(0xff1830), new THREE.Color(0.075, 0.022, 0.03), new THREE.Color(0.85, 0.42, 0.4)],
+  [new THREE.Color(0xb44bff), new THREE.Color(0.048, 0.028, 0.08), new THREE.Color(0.6, 0.48, 0.9)],
+  [new THREE.Color(0x22eaff), new THREE.Color(0.022, 0.058, 0.08), new THREE.Color(0.42, 0.72, 0.88)],
+  [new THREE.Color(0xff7410), new THREE.Color(0.072, 0.045, 0.02), new THREE.Color(0.9, 0.6, 0.32)],
+];
 
 function rng(seed: number) {
   return () => {
@@ -154,6 +163,20 @@ export class ZombieHordeVisual extends Visual {
   private handCursor = 0;
   private dropTime = -100;
   private dummy = new THREE.Object3D();
+  private twitch = new Float32Array(ZOMBIES);
+  private twitchAttr!: THREE.InstancedBufferAttribute;
+  private motes!: THREE.Points<THREE.BufferGeometry, THREE.ShaderMaterial>;
+  private glow = MOODS[0][0].clone();
+  private fogBase = MOODS[0][1].clone();
+  private rimC = MOODS[0][2].clone();
+  private moonC = new THREE.Color();
+  private eyeBands = new Array<number>(EYE_BANDS.length).fill(0);
+  private mood = 0;
+  private moodFrom = 0;
+  private moodMix = 1;
+  private moodSpeed = 0.4;
+  private beatsInMood = 0;
+  private snap = 0;
 
   protected setup() {
     const rand = rng(1313);
@@ -162,33 +185,34 @@ export class ZombieHordeVisual extends Visual {
     this.sky = fullscreenQuad(
       /* glsl */ `
       uniform float time, aspect, flare;
+      uniform vec3 fogc, moonc, glowc;
       varying vec2 vUv;
       ${GLSL_NOISE}
       void main() {
         vec2 p = (vUv - 0.5) * vec2(aspect, 1.0);
-        vec3 fogc = ${glslColor(FOG_COLOR)};
-        vec3 col = mix(fogc, vec3(0.004, 0.012, 0.008), smoothstep(-0.12, 0.45, p.y));
+        vec3 col = mix(fogc, fogc * 0.15, smoothstep(-0.12, 0.45, p.y));
         float clouds = fbm(vec3(p * vec2(1.4, 3.2) + vec2(time * 0.015, 0.0), time * 0.025));
         vec2 mp = p - vec2(-0.22, 0.2);
         float glow = exp(-length(mp * vec2(0.8, 1.0)) * 3.0);
-        col += ${glslColor(MOON_COLOR)} * glow * 0.12;
-        col += vec3(0.03, 0.08, 0.04) * smoothstep(0.0, 0.7, clouds) * smoothstep(-0.2, 0.3, p.y) * (0.6 + glow * 2.0);
-        col += ${glslColor(PALETTE.toxic)} * flare * 0.12 * (1.0 - smoothstep(-0.3, 0.4, p.y));
+        col += moonc * glow * 0.12;
+        col += fogc * 1.05 * smoothstep(0.0, 0.7, clouds) * smoothstep(-0.2, 0.3, p.y) * (0.6 + glow * 2.0);
+        col += glowc * flare * 0.12 * (1.0 - smoothstep(-0.3, 0.4, p.y));
         gl_FragColor = vec4(col, 1.0);
       }`,
-      { time: { value: 0 }, aspect: { value: 1 }, flare: { value: 0 } },
+      { time: { value: 0 }, aspect: { value: 1 }, flare: { value: 0 }, fogc: { value: this.fogBase }, moonc: { value: this.moonC }, glowc: { value: this.glow } },
     );
     this.scene.add(this.sky);
 
     this.moon = new THREE.Mesh(
       new THREE.PlaneGeometry(1, 1),
       new THREE.ShaderMaterial({
-        uniforms: { glow: { value: 0 } },
+        uniforms: { glow: { value: 0 }, moonc: { value: this.moonC } },
         transparent: true,
         depthWrite: false,
         vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
         fragmentShader: /* glsl */ `
           uniform float glow;
+          uniform vec3 moonc;
           varying vec2 vUv;
           ${GLSL_NOISE}
           void main() {
@@ -196,9 +220,9 @@ export class ZombieHordeVisual extends Visual {
             float r = length(p);
             float disc = smoothstep(0.36, 0.35, r);
             float craters = fbm(vec3(p * 4.0, 2.0)) * 0.5 + 0.5;
-            vec3 moon = ${glslColor(MOON_COLOR)} * (0.55 + 0.45 * craters) * 0.85;
+            vec3 moon = moonc * (0.55 + 0.45 * craters) * 0.85;
             float halo = exp(-max(r - 0.35, 0.0) * 7.0) * (0.25 + glow * 0.3);
-            vec3 col = moon * disc + ${glslColor(MOON_COLOR)} * halo * 0.6 * (1.0 - disc);
+            vec3 col = moon * disc + moonc * halo * 0.6 * (1.0 - disc);
             gl_FragColor = vec4(col, max(disc, halo));
           }`,
       }),
@@ -267,6 +291,9 @@ export class ZombieHordeVisual extends Visual {
       this.zyaw[i] = (rand() - 0.5) * 1.3;
     }
     geo.setAttribute('aRand', new THREE.InstancedBufferAttribute(rnd, 4));
+    this.twitchAttr = new THREE.InstancedBufferAttribute(this.twitch, 1);
+    this.twitchAttr.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute('aTwitch', this.twitchAttr);
     this.horde = new THREE.InstancedMesh(
       geo,
       new THREE.ShaderMaterial({
@@ -280,15 +307,22 @@ export class ZombieHordeVisual extends Visual {
           uFlare: { value: 0 },
           uRim: { value: 0.35 },
           uMoonDir: { value: new THREE.Vector3(-0.3, 0.5, -1).normalize() },
+          uGlow: { value: this.glow },
+          uRimC: { value: this.rimC },
+          uBand: { value: this.eyeBands },
+          uSnap: { value: 0 },
         },
         vertexShader: /* glsl */ `
-          uniform float uTravel, uLurch, uSurge;
+          uniform float uTravel, uLurch, uSurge, uSnap;
+          uniform float uBand[${EYE_BANDS.length}];
           attribute float aPart;
           attribute vec3 aPivot;
           attribute vec4 aRand;
+          attribute float aTwitch;
           varying vec3 vN;
           varying vec3 vW;
           varying float vPart;
+          varying float vEye;
           mat3 rotX(float a) { float c = cos(a), s = sin(a); return mat3(1.0, 0.0, 0.0, 0.0, c, s, 0.0, -s, c); }
           mat3 rotZ(float a) { float c = cos(a), s = sin(a); return mat3(c, s, 0.0, -s, c, 0.0, 0.0, 0.0, 1.0); }
           void main() {
@@ -309,12 +343,13 @@ export class ZombieHordeVisual extends Visual {
               if (pt == 2 || pt == 3) {
                 float side = pt == 2 ? 1.0 : -1.0;
                 float droop = aRand.z * side > 0.5 ? 0.7 : 0.0;
-                float a = -1.3 + droop + 0.14 * sin(g * 0.5 + side * 1.7 + aRand.x * 9.0) - lurch * 0.45 - uSurge * 0.2;
+                float a = -1.3 + droop + 0.14 * sin(g * 0.5 + side * 1.7 + aRand.x * 9.0) - lurch * 0.45 - uSurge * 0.2 - aTwitch * 0.85 - uSnap * 0.12;
                 mat3 R = rotZ(side * (0.12 + 0.08 * sin(g + side))) * rotX(a);
                 p = R * (p - aPivot) + aPivot;
                 n = R * n;
               } else if (pt == 1 || pt == 6) {
-                mat3 R = rotZ(aRand.z * 0.55 + sin(g * 0.5) * 0.12 - lurch * aRand.z * 0.4) * rotX(0.2 + lurch * 0.55);
+                float jerk = aTwitch * (aRand.z > 0.0 ? 0.9 : -0.9) * (0.6 + 0.4 * sin(aTwitch * 30.0));
+                mat3 R = rotZ(aRand.z * 0.55 + sin(g * 0.5) * 0.12 - lurch * aRand.z * 0.4 + jerk) * rotX(0.2 + lurch * 0.55 - aTwitch * 0.5);
                 p = R * (p - aPivot) + aPivot;
                 n = R * n;
               }
@@ -329,19 +364,25 @@ export class ZombieHordeVisual extends Visual {
             vW = w.xyz;
             vN = normalize(mat3(m) * n);
             vPart = aPart;
+            // each zombie's eyes ride their own slice of the spectrum
+            int bi = int(aRand.y * ${EYE_BANDS.length}.0);
+            float band = 0.0;
+            for (int k = 0; k < ${EYE_BANDS.length}; k++) if (k == bi) band = uBand[k];
+            vEye = (0.35 + band * 1.3) * (1.0 + aTwitch * 3.0);
             gl_Position = projectionMatrix * viewMatrix * w;
           }`,
         fragmentShader: /* glsl */ `
-          uniform vec3 uFogColor, uMoonDir;
-          uniform float uFogDensity, uEyes, uFlare, uRim;
+          uniform vec3 uFogColor, uMoonDir, uGlow, uRimC;
+          uniform float uFogDensity, uEyes, uFlare, uRim, uSnap;
           varying vec3 vN;
           varying vec3 vW;
           varying float vPart;
+          varying float vEye;
           void main() {
             float dist = length(cameraPosition - vW);
             if (vPart > 5.5) {
-              vec3 e = ${glslColor(PALETTE.toxic)} * uEyes;
-              float fe = 1.0 - exp(-pow(uFogDensity * dist * 0.55, 2.0));
+              vec3 e = uGlow * uEyes * vEye;
+              float fe = 1.0 - exp(-pow(uFogDensity * dist * 0.55, 2.0)) * (1.0 - step(2.0, vEye) * 0.3);
               gl_FragColor = vec4(mix(e, uFogColor, fe), 1.0);
               return;
             }
@@ -351,8 +392,8 @@ export class ZombieHordeVisual extends Visual {
             float back = clamp(dot(N, uMoonDir) + 0.15, 0.0, 1.0);
             float top = clamp(N.y * 0.5 + 0.5, 0.0, 1.0);
             vec3 col = vec3(0.014, 0.02, 0.012) * (0.4 + 0.8 * top);
-            col += vec3(0.42, 0.75, 0.38) * rim * back * uRim;
-            col += ${glslColor(PALETTE.toxic)} * uFlare * 0.06 * max(dot(N, normalize(vec3(0.0, 0.2, 1.0))), 0.0);
+            col += uRimC * rim * back * uRim;
+            col += uGlow * (uFlare * 0.06 + uSnap * 0.025) * max(dot(N, normalize(vec3(0.0, 0.2, 1.0))), 0.0);
             float f = 1.0 - exp(-pow(uFogDensity * dist, 2.0));
             gl_FragColor = vec4(mix(col, uFogColor, f), 1.0);
           }`,
@@ -400,7 +441,7 @@ export class ZombieHordeVisual extends Visual {
     this.dirt = new THREE.Points(
       dg,
       new THREE.ShaderMaterial({
-        uniforms: { scale: { value: 400 } },
+        uniforms: { scale: { value: 400 }, glowc: { value: this.glow } },
         transparent: true,
         depthWrite: false,
         vertexShader: /* glsl */ `
@@ -416,12 +457,13 @@ export class ZombieHordeVisual extends Visual {
             gl_Position = projectionMatrix * mv;
           }`,
         fragmentShader: /* glsl */ `
+          uniform vec3 glowc;
           varying float vLife;
           varying float vSpark;
           void main() {
             float d = length(gl_PointCoord - 0.5);
             if (d > 0.5 || vLife <= 0.0) discard;
-            vec3 col = vSpark > 0.5 ? ${glslColor(PALETTE.toxic)} * 1.6 : vec3(0.09, 0.07, 0.04);
+            vec3 col = vSpark > 0.5 ? glowc * 1.6 : vec3(0.09, 0.07, 0.04);
             float a = smoothstep(0.5, 0.25, d) * min(1.0, vLife * 2.0);
             gl_FragColor = vec4(col, a);
           }`,
@@ -433,7 +475,7 @@ export class ZombieHordeVisual extends Visual {
     // Ground fog
     for (let i = 0; i < 3; i++) {
       const mat = new THREE.ShaderMaterial({
-        uniforms: { time: { value: 0 }, density: { value: 0.3 }, flare: { value: 0 }, seed: { value: i * 5.1 } },
+        uniforms: { time: { value: 0 }, density: { value: 0.3 }, flare: { value: 0 }, seed: { value: i * 5.1 }, fogc: { value: this.fogBase }, glowc: { value: this.glow } },
         transparent: true,
         depthWrite: false,
         vertexShader: /* glsl */ `
@@ -445,6 +487,7 @@ export class ZombieHordeVisual extends Visual {
           }`,
         fragmentShader: /* glsl */ `
           uniform float time, density, flare, seed;
+          uniform vec3 fogc, glowc;
           varying vec3 vWorld;
           ${GLSL_NOISE}
           void main() {
@@ -452,7 +495,7 @@ export class ZombieHordeVisual extends Visual {
             float a = smoothstep(-0.25, 0.8, n) * density;
             float dist = length(vWorld.xz - cameraPosition.xz);
             a *= smoothstep(1.5, 6.0, dist) * (1.0 - smoothstep(45.0, 90.0, dist));
-            vec3 col = mix(vec3(0.1, 0.2, 0.11), vec3(0.2, 0.6, 0.15), flare);
+            vec3 col = mix(fogc * 2.7, glowc * 0.5 + fogc, flare);
             gl_FragColor = vec4(col, a);
           }`,
       });
@@ -461,6 +504,55 @@ export class ZombieHordeVisual extends Visual {
       this.fogLayers.push(fog);
       this.scene.add(fog);
     }
+
+    // Grave motes drifting in the fog; hi-hats make a fresh random handful flash.
+    const mp = new Float32Array(MOTES * 3);
+    for (let i = 0; i < MOTES; i++) {
+      mp[i * 3] = (rand() - 0.5) * 22;
+      mp[i * 3 + 1] = 0.3 + rand() * 4.2;
+      mp[i * 3 + 2] = 7 - rand() * 40;
+    }
+    const mg = new THREE.BufferGeometry();
+    mg.setAttribute('position', new THREE.BufferAttribute(mp, 3));
+    this.motes = new THREE.Points(
+      mg,
+      new THREE.ShaderMaterial({
+        uniforms: { time: { value: 0 }, scale: { value: 400 }, treble: { value: 0 }, hat: { value: 0 }, seed: { value: 0 }, glowc: { value: this.glow } },
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        vertexShader: /* glsl */ `
+          uniform float time, scale, treble, hat, seed;
+          varying float vA;
+          float h1(float n) { return fract(sin(n) * 43758.5453); }
+          void main() {
+            float id = float(gl_VertexID);
+            vec3 p = position;
+            p.x += sin(time * 0.3 + id * 1.7) * 0.6;
+            p.y += sin(time * 0.45 + id * 2.3) * 0.35;
+            p.z += cos(time * 0.25 + id) * 0.5;
+            float lit = step(h1(id * 12.9898 + seed * 78.233), 0.3);
+            vA = 0.08 + treble * 0.25 + lit * hat * 1.4;
+            vec4 mv = modelViewMatrix * vec4(p, 1.0);
+            gl_PointSize = scale * (0.035 + lit * hat * 0.05) / -mv.z;
+            gl_Position = projectionMatrix * mv;
+          }`,
+        fragmentShader: /* glsl */ `
+          uniform vec3 glowc;
+          varying float vA;
+          void main() {
+            vec2 c = gl_PointCoord - 0.5;
+            float d = length(c);
+            float star = max(0.0, 1.0 - abs(c.x) * 14.0) * max(0.0, 1.0 - abs(c.y) * 2.2)
+                       + max(0.0, 1.0 - abs(c.y) * 14.0) * max(0.0, 1.0 - abs(c.x) * 2.2);
+            float a = (exp(-d * d * 60.0) + star * 0.5) * vA;
+            gl_FragColor = vec4(mix(glowc, vec3(1.0), 0.45) * a, 1.0);
+          }`,
+      }),
+    );
+    this.motes.frustumCulled = false;
+    this.scene.add(this.motes);
+    this.applyMood(0);
 
     const cam = this.camera as THREE.PerspectiveCamera;
     cam.fov = 55;
@@ -473,6 +565,43 @@ export class ZombieHordeVisual extends Visual {
     if (!this.sky) return;
     this.sky.material.uniforms.aspect.value = w / h;
     this.dirt.material.uniforms.scale.value = h * 0.9;
+    this.motes.material.uniforms.scale.value = h * 0.9;
+  }
+
+  private applyMood(brightness: number) {
+    const m = this.moodMix * this.moodMix * (3 - 2 * this.moodMix);
+    const [fg, ff, fr] = MOODS[this.moodFrom];
+    const [tg, tf, tr] = MOODS[this.mood];
+    this.glow.copy(fg).lerp(tg, m);
+    this.fogBase.copy(ff).lerp(tf, m);
+    this.rimC.copy(fr).lerp(tr, m);
+    // airy, bright music drifts the hue a little and warms the glow towards white
+    this.glow.offsetHSL((brightness - 0.5) * 0.07, 0, 0).lerp(PALETTE.bone, brightness * 0.15);
+    this.moonC.copy(PALETTE.moon).lerp(this.glow, 0.3);
+  }
+
+  private updateMood(dt: number, audio: AudioFeatures) {
+    if (audio.beat) this.beatsInMood++;
+    if (audio.drop || this.beatsInMood >= 32) {
+      this.moodFrom = this.mood;
+      this.mood = (this.mood + 1 + (audio.drop ? Math.floor(Math.random() * 2) : 0)) % MOODS.length;
+      this.moodMix = 0;
+      this.moodSpeed = audio.drop ? 2.5 : 0.35;
+      this.beatsInMood = 0;
+    }
+    this.moodMix = Math.min(1, this.moodMix + dt * this.moodSpeed);
+    this.applyMood(audio.brightness);
+  }
+
+  /** Snare/clap: a few zombies near the front jerk their heads and claw at the sky, eyes flaring. */
+  private twitchSome() {
+    let n = 3 + Math.floor(Math.random() * 3);
+    for (let tries = 0; tries < 40 && n > 0; tries++) {
+      const i = Math.floor(Math.random() * ZOMBIES);
+      if (this.zz[i] < -28 || this.zz[i] > 3 || this.twitch[i] > 0.3) continue;
+      this.twitch[i] = 1;
+      n--;
+    }
   }
 
   private triggerHand(force = false) {
@@ -511,18 +640,30 @@ export class ZombieHordeVisual extends Visual {
       if (audio.bass > 0.6) this.triggerHand();
     }
     if (audio.drop) this.dropTime = time;
+    this.updateMood(dt, audio);
+    if (audio.midHit) {
+      this.twitchSome();
+      this.snap = 1;
+    }
+    this.snap = Math.max(0, this.snap - dt * 4);
+    for (let i = 0; i < ZOMBIES; i++) if (this.twitch[i] > 0) this.twitch[i] = Math.max(0, this.twitch[i] - dt * 1.6);
+    this.twitchAttr.needsUpdate = true;
+    for (let k = 0; k < EYE_BANDS.length; k++) {
+      const b = audio.bands[EYE_BANDS[k]] ?? 0;
+      this.eyeBands[k] = damp(this.eyeBands[k], b, b > this.eyeBands[k] ? 18 : 5, dt);
+    }
     const sinceDrop = time - this.dropTime;
     this.surge = damp(this.surge, sinceDrop < 3.5 ? 1 : 0, sinceDrop < 3.5 ? 4 : 0.8, dt);
     this.flare = sinceDrop < 0.15 ? damp(this.flare, 1, 30, dt) : damp(this.flare, 0, 0.6, dt);
     this.speed = damp(this.speed, 0.35 + audio.level * 1.1 + this.surge * 2.4, 2, dt);
     this.travel += dt * this.speed;
-    this.eyes = damp(this.eyes, 1.2 + audio.mid * 6 + audio.beatPulse * 2 + this.flare * 4, 6, dt);
+    this.eyes = damp(this.eyes, 1.6 + audio.mid * 5 + audio.beatPulse * 2 + this.flare * 4, 6, dt);
 
     const u = this.horde.material.uniforms;
     const fogDensity = 0.022 + audio.bass * 0.01 - this.flare * 0.005;
     (this.scene.fog as THREE.FogExp2).density = fogDensity;
     const fogCol = u.uFogColor.value as THREE.Color;
-    fogCol.copy(FOG_COLOR).lerp(PALETTE.toxic, this.flare * 0.06 + audio.beatPulse * 0.01);
+    fogCol.copy(this.fogBase).lerp(this.glow, this.flare * 0.06 + audio.beatPulse * 0.01 + audio.midPulse * 0.008);
     (this.scene.fog as THREE.FogExp2).color.copy(fogCol);
     u.uTravel.value = this.travel;
     u.uLurch.value = audio.beatPulse * (0.6 + audio.bass * 0.6);
@@ -530,6 +671,7 @@ export class ZombieHordeVisual extends Visual {
     u.uFogDensity.value = fogDensity;
     u.uEyes.value = this.eyes;
     u.uFlare.value = this.flare;
+    u.uSnap.value = this.snap;
     u.uRim.value = 0.3 + audio.beatPulse * 0.15 + this.flare * 0.3;
 
     // Move the horde forward; recycle zombies that walk past the camera.
@@ -597,12 +739,22 @@ export class ZombieHordeVisual extends Visual {
       f.material.uniforms.density.value = 0.08 + audio.bass * 0.16 + this.flare * 0.1;
       f.material.uniforms.flare.value = this.flare;
     }
+    const mu = this.motes.material.uniforms;
+    mu.time.value = time;
+    mu.treble.value = audio.treble;
+    mu.hat.value = audio.treblePulse;
+    if (audio.trebleHit) mu.seed.value = audio.trebleHitCount % 997;
     this.sky.material.uniforms.time.value = time;
     this.sky.material.uniforms.flare.value = this.flare;
     this.moon.material.uniforms.glow.value = audio.bass + this.flare;
     this.hemi.intensity = 0.45 + this.flare * 1.5;
     this.moonLight.intensity = 1.2 + audio.beatPulse * 0.4 + this.flare * 2;
-    for (const l of this.toxicLights) l.intensity = 0.6 + audio.mid * 1.5 + audio.beatPulse * 1.5 + this.flare * 10;
+    for (const l of this.toxicLights) {
+      l.color.copy(this.glow);
+      l.intensity = 0.6 + audio.mid * 1.2 + audio.midPulse * 2.5 + audio.beatPulse * 1.5 + this.flare * 10;
+    }
+    this.hemi.color.copy(this.rimC).multiplyScalar(0.33);
+    this.moonLight.color.copy(this.moonC);
 
     // Camera: slow sway, bass shake
     this.shake = damp(this.shake, audio.bass * 0.06 + audio.beatPulse * 0.07 + this.flare * 0.08, 8, dt);

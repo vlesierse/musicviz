@@ -2,9 +2,20 @@ import * as THREE from 'three';
 import type { AudioFeatures } from '../audio/features';
 import { GLSL_NOISE } from '../core/glsl';
 import { drawSkull } from '../core/shapes';
-import { Visual, damp, fullscreenQuad } from '../core/Visual';
+import { SpectrumTexture, Visual, damp, fullscreenQuad } from '../core/Visual';
 
 const WAVE_N = 256;
+
+/** Per-channel phosphor casts [picture tint, accent (trace / EQ / colour bleed)]. Index 0 is the drop's cursed channel. */
+const CASTS: Array<[THREE.Color, THREE.Color]> = [
+  [new THREE.Color(1.0, 0.25, 0.22), new THREE.Color(1.0, 0.7, 0.2)],
+  [new THREE.Color(0.75, 0.88, 1.0), new THREE.Color(0.35, 1.0, 0.55)],
+  [new THREE.Color(0.42, 1.0, 0.45), new THREE.Color(1.0, 0.25, 0.85)],
+  [new THREE.Color(0.72, 0.42, 1.0), new THREE.Color(0.4, 1.0, 0.25)],
+  [new THREE.Color(0.3, 1.0, 0.92), new THREE.Color(1.0, 0.45, 0.1)],
+  [new THREE.Color(1.0, 0.38, 0.85), new THREE.Color(0.25, 0.8, 1.0)],
+  [new THREE.Color(1.0, 0.68, 0.3), new THREE.Color(0.7, 0.25, 1.0)],
+];
 
 /** Pale long-haired girl (left half) and a skull (right half), each 512×384, white-on-transparent. */
 function faceTexture() {
@@ -101,8 +112,10 @@ function faceTexture() {
 }
 
 const FRAG = /* glsl */ `
-uniform sampler2D faceTex, waveTex, osdTex;
+uniform sampler2D faceTex, waveTex, osdTex, specTex;
 uniform float time, aspect, frame, staticAmt, waveAmp, glitch, face, faceSel, faceZoom, drop, osd, zoom, roll, tvLight, trackY, bass;
+uniform float eqAmt, tear, tearY, dropout, dropSeed, chroma, led, treble;
+uniform vec3 tint, accent, lightCol;
 uniform vec2 shake;
 varying vec2 vUv;
 ${GLSL_NOISE}
@@ -128,13 +141,25 @@ vec3 content(vec2 uv, vec2 nuv) {
   float inside = step(0.0, fuv.x) * step(fuv.x, 1.0) * step(0.0, fuv.y) * step(fuv.y, 1.0);
   float m = f.a * face * inside;
   float img = mix(st, f.r * (0.7 + 0.6 * n), m);
-  vec3 c = vec3(img) * vec3(0.82, 0.9, 1.0);
+  // chroma noise: some snow grains bleed into the accent colour
+  float bleed = step(0.82 - chroma * 0.25, hash21(cell * 1.37 + frame * vec2(5.3, 11.9)));
+  vec3 c = vec3(img) * mix(tint, accent * 1.2, bleed * (1.0 - m) * 0.7);
+  // ghostly equaliser rising through the snow
+  float col32 = floor(uv.x * 32.0);
+  float bh = texture2D(specTex, vec2((col32 + 0.5) / 32.0, 0.5)).r;
+  float seg = step(0.28, fract(uv.y * 36.0)) * step(0.14, fract(uv.x * 32.0)) * step(fract(uv.x * 32.0), 0.86);
+  float bh2 = bh * bh * 0.75;
+  float bar = step(uv.y, 0.03 + bh2) * seg;
+  float cap = smoothstep(0.03, 0.0, abs(uv.y - 0.03 - bh2)) * seg;
+  vec3 eqc = mix(accent, tint, smoothstep(0.05, 0.7, uv.y));
+  c = mix(c, c * 0.35, bar * eqAmt * (1.0 - m));
+  c += eqc * (bar * (0.9 + 0.5 * n) + cap * 1.5) * eqAmt * (1.0 - m * 0.85);
   // oscilloscope
   float y = 0.5 + wave(uv.x) * 0.36 * waveAmp;
   float dy = (wave(uv.x + 1.0 / ${WAVE_N}.0) - wave(uv.x - 1.0 / ${WAVE_N}.0)) * 0.36 * waveAmp * ${WAVE_N / 2}.0;
   float dist = abs(uv.y - y) / sqrt(1.0 + dy * dy);
   float line = exp(-pow(dist / 0.0045, 2.0)) + 0.25 * exp(-dist * 90.0);
-  c += vec3(0.5, 1.0, 0.7) * line * (0.25 + 0.75 * waveAmp) * (1.0 - m * 0.7);
+  c += accent * line * (0.25 + 0.75 * waveAmp) * (1.0 - m * 0.7);
   // rolling hum bar
   c *= 0.8 + 0.35 * smoothstep(0.4, 1.0, sin((uv.y + time * 0.11) * 6.2832));
   // scanlines
@@ -151,12 +176,22 @@ vec3 screen(vec2 suv) {
   uv.x += jit + band * (0.025 + glitch * 0.12) * (hash11(ln * 0.31 + frame) - 0.5) * 2.0;
   float seg = floor(uv.y * 14.0 + floor(time * 24.0) * 3.0);
   uv.x += glitch * (hash11(seg) - 0.5) * 0.25 * step(0.55, hash11(seg * 3.1));
-  float sh = 0.0025 + glitch * 0.02 + drop * 0.008;
+  // snare/clap: a hard tear slices a block of lines sideways
+  float tb = smoothstep(0.09, 0.07, abs(uv.y - tearY));
+  uv.x += tb * tear * (0.08 + 0.05 * sin(uv.y * 90.0 + time * 40.0));
+  float sh = 0.0025 + glitch * 0.02 + drop * 0.008 + tear * 0.012;
   vec3 c;
   c.r = content(uv + vec2(sh, 0.0), uv).r;
   c.g = content(uv, uv).g;
   c.b = content(uv - vec2(sh, 0.0), uv).b;
-  c += vec3(0.0, 0.0, 0.06) * band * (1.0 + glitch); // tracking band noise
+  c += accent * 0.08 * band * (1.0 + glitch); // tracking band noise
+  c += accent * tb * tear * 0.35;
+  // hi-hats: bright VHS dropout streaks on random lines
+  float dl = floor(uv.y * 160.0);
+  float dh = hash11(dl * 7.31 + dropSeed * 3.7);
+  float x0 = hash11(dl * 1.9 + dropSeed);
+  float streak = step(0.955 - treble * 0.02, dh) * smoothstep(0.0, 0.02, uv.x - x0) * smoothstep(0.0, 0.08, x0 + 0.08 + dh * 0.25 - uv.x);
+  c += mix(vec3(1.0), accent, step(0.985, dh)) * streak * dropout * 1.3;
   vec4 o = texture2D(osdTex, suv * 0.5 + 0.5);
   c = mix(c, o.rgb * 1.6, o.a * osd);
   return c;
@@ -165,7 +200,7 @@ vec3 screen(vec2 suv) {
 void main() {
   vec2 p = (vUv - 0.5) * vec2(aspect, 1.0) * 1.3 / zoom + shake + vec2(-0.1, 0.0) * (zoom - 1.0) + vec2(0.0, -0.06);
   float flick = 0.9 + 0.1 * hash11(frame * 0.71);
-  vec3 L = vec3(0.38, 0.58, 1.0) * tvLight * flick;
+  vec3 L = lightCol * tvLight * flick;
 
   // ---- room: wallpaper + floorboards lit by the TV ----
   vec3 col;
@@ -242,7 +277,7 @@ void main() {
     float slots = smoothstep(0.3, 0.5, abs(fract(gp.y * 60.0) - 0.5) * 2.0);
     bc = mix(bc, vec3(0.006) + L * 0.015 * slots, smoothstep(0.002, 0.0, grille));
     // red standby LED
-    bc += vec3(1.5, 0.05, 0.02) * smoothstep(0.006, 0.003, length(kp - vec2(0.0, -0.27)));
+    bc += vec3(1.5, 0.05, 0.02) * (1.0 + led * 2.5) * smoothstep(0.006 + led * 0.002, 0.003, length(kp - vec2(0.0, -0.27)));
     col = mix(col, bc, smoothstep(0.003, 0.0, body));
   }
 
@@ -295,6 +330,20 @@ export class PossessedTvVisual extends Visual {
   private rollVel = 0;
   private zoom = 1;
   private light = 0.5;
+  private spec = new SpectrumTexture(64);
+  private cast = 1;
+  private castFrom = 1;
+  private castMix = 1;
+  private castSpeed = 3;
+  private tint = new THREE.Color();
+  private accent = new THREE.Color();
+  private lightCol = new THREE.Color();
+  private tear = 0;
+  private tearY = 0.5;
+  private dropout = 0;
+  private chroma = 0;
+  private led = 0;
+  private eqAmt = 0.3;
 
   protected setup() {
     this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
@@ -330,9 +379,29 @@ export class PossessedTvVisual extends Visual {
       trackY: { value: 0.3 },
       bass: { value: 0 },
       shake: { value: new THREE.Vector2() },
+      specTex: { value: this.spec.texture },
+      eqAmt: { value: 0.3 },
+      tear: { value: 0 },
+      tearY: { value: 0.5 },
+      dropout: { value: 0 },
+      dropSeed: { value: 0 },
+      chroma: { value: 0 },
+      led: { value: 0 },
+      treble: { value: 0 },
+      tint: { value: this.tint },
+      accent: { value: this.accent },
+      lightCol: { value: this.lightCol },
     };
     this.quad = fullscreenQuad(FRAG, this.u);
     this.scene.add(this.quad);
+  }
+
+  private setCast(i: number, speed: number) {
+    if (i === this.cast) return;
+    this.castFrom = this.cast;
+    this.cast = i;
+    this.castMix = 0;
+    this.castSpeed = speed;
   }
 
   private drawOsd(ch: number) {
@@ -389,13 +458,14 @@ export class PossessedTvVisual extends Visual {
       this.drawOsd(13);
       this.osdTimer = 3.5;
       this.rollVel = 2.5;
+      this.setCast(0, 4);
     }
     this.dropT = Math.max(0, this.dropT - dt);
     const inDrop = this.dropT > 0 ? 1 : 0;
 
     if (audio.beat) {
       this.glitch = 1;
-      if (Math.random() < 0.45 && !inDrop) {
+      if (Math.random() < 0.2 && !inDrop) {
         this.faceFlash = 1;
         this.faceSel = Math.random() < 0.65 ? 0 : 1;
       }
@@ -404,10 +474,42 @@ export class PossessedTvVisual extends Visual {
         this.drawOsd(this.channel);
         this.osdTimer = 1.5;
         this.rollVel = 1.2;
+        // every channel has its own phosphor cast
+        this.setCast(1 + ((this.cast + Math.floor(Math.random() * (CASTS.length - 2))) % (CASTS.length - 1)), 3);
       }
     }
+    // snare/clap: the picture tears and something tries to come through
+    if (audio.midHit) {
+      this.tear = 1;
+      this.tearY = 0.1 + Math.random() * 0.8;
+      this.chroma = 1;
+      if (Math.random() < 0.4 && !inDrop) {
+        this.faceFlash = Math.max(this.faceFlash, 0.9);
+        this.faceSel = Math.random() < 0.65 ? 0 : 1;
+      }
+    }
+    // hi-hats: VHS dropout streaks and the standby LED blinks
+    if (audio.trebleHit) {
+      this.dropout = 1;
+      this.led = 1;
+      this.u.dropSeed.value = audio.trebleHitCount % 997;
+    }
     this.glitch *= Math.exp(-9 * dt);
-    this.faceFlash *= Math.exp(-5 * dt);
+    this.faceFlash *= Math.exp(-3.5 * dt);
+    this.tear *= Math.exp(-5 * dt);
+    this.chroma *= Math.exp(-3 * dt);
+    this.dropout *= Math.exp(-6 * dt);
+    this.led *= Math.exp(-8 * dt);
+
+    this.castMix = Math.min(1, this.castMix + dt * this.castSpeed);
+    const cm = this.castMix * this.castMix * (3 - 2 * this.castMix);
+    this.tint.copy(CASTS[this.castFrom][0]).lerp(CASTS[this.cast][0], cm);
+    this.accent.copy(CASTS[this.castFrom][1]).lerp(CASTS[this.cast][1], cm);
+    // brighter music bleeds the accent into the picture
+    this.tint.lerp(this.accent, audio.brightness * 0.25);
+    this.lightCol.setRGB(0.38, 0.58, 1.0).lerp(this.tint, 0.6).lerp(this.accent, this.chroma * 0.25);
+    this.spec.update(audio.bands);
+    this.eqAmt = damp(this.eqAmt, 0.18 + audio.mid * 0.35 + audio.level * 0.25, 6, dt);
     this.osdTimer = Math.max(0, this.osdTimer - dt);
 
     // vertical hold slips after channel changes / drops
@@ -438,6 +540,13 @@ export class PossessedTvVisual extends Visual {
     u.tvLight.value = this.light;
     u.trackY.value = this.trackY - 0.1;
     u.bass.value = audio.bass;
+    u.eqAmt.value = this.eqAmt * (1 - face * 0.7);
+    u.tear.value = this.tear;
+    u.tearY.value = this.tearY;
+    u.dropout.value = this.dropout;
+    u.chroma.value = this.chroma;
+    u.led.value = this.led;
+    u.treble.value = audio.treble;
     const shake = inDrop * 0.006 + this.glitch * 0.002;
     (u.shake.value as THREE.Vector2).set((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
   }

@@ -10,7 +10,21 @@ const FANG_X = 0.17;
 const FANG_LEN = 0.23;
 const DROPS = 220;
 const BATS = 70;
-const SPLATS = 10;
+const SPLATS = 12;
+const UX = [0.034, 0.1, FANG_X, 0.236, 0.292, 0.344, 0.392];
+const UL = [0.06, 0.05, FANG_LEN, 0.042, 0.036, 0.032, 0.028];
+/** Spectrum band that lights each upper tooth's edge (centre = low, corners = high). */
+const TOOTH_BANDS = [6, 12, 18, 26, 34, 42, 50];
+
+/** Mood lighting [candle light, cape satin]; cycles every 32 beats and on drops. Blood stays red. */
+const MOODS: Array<[THREE.Color, THREE.Color]> = [
+  [new THREE.Color(1.0, 0.33, 0.08), new THREE.Color(0.32, 0.01, 0.03)],
+  [new THREE.Color(0.75, 0.3, 1.0), new THREE.Color(0.2, 0.02, 0.36)],
+  [new THREE.Color(0.45, 1.0, 0.18), new THREE.Color(0.03, 0.24, 0.06)],
+  [new THREE.Color(0.25, 0.8, 1.0), new THREE.Color(0.02, 0.12, 0.32)],
+  [new THREE.Color(1.0, 0.55, 0.08), new THREE.Color(0.36, 0.02, 0.22)],
+];
+const HOT_CANDLE = new THREE.Color(1.0, 0.92, 0.78);
 
 /** Inner edge of the upper lip (mirrors the shader). */
 function yTop(x: number, open: number) {
@@ -20,7 +34,10 @@ function yTop(x: number, open: number) {
 }
 
 const MOUTH_FRAG = /* glsl */ `
-uniform float time, aspect, open, gum, bass, beatPulse, dropPulse, glow, blood, flicker, px;
+uniform float time, aspect, open, gum, bass, beatPulse, dropPulse, glow, blood, flicker, px, snarl, glint, treble;
+uniform vec3 candle, satinC;
+uniform vec2 glintPos;
+uniform float tband[7];
 varying vec2 vUv;
 ${GLSL_NOISE}
 #define MY ${MY.toFixed(3)}
@@ -58,7 +75,7 @@ vec4 tooth(float ax, float y, float cx, float hw, float len, float g, float dir,
   return vec4(cov, nx, t, fang ? 1.0 : 0.0);
 }
 
-vec3 shadeTooth(vec4 tt, float sx, float depth, bool upper) {
+vec3 shadeTooth(vec4 tt, float sx, float depth, bool upper, float bandV) {
   float nx = tt.y * sx;
   float t = tt.z;
   vec3 N = normalize(vec3(nx * 0.85, (upper ? -0.15 + 0.35 * t : 0.15 - 0.35 * t), sqrt(max(1.0 - nx * nx * 0.72, 0.05))));
@@ -66,11 +83,11 @@ vec3 shadeTooth(vec4 tt, float sx, float depth, bool upper) {
   enamel = mix(enamel, vec3(0.42, 0.45, 0.5), smoothstep(0.75, 1.0, t) * 0.6);
   float diff = 0.35 + 0.65 * max(dot(N, KEY), 0.0);
   vec3 col = enamel * diff;
-  col += vec3(0.25, 0.12, 0.04) * max(dot(N, CANDLE), 0.0) * flicker;
+  col += candle * 0.25 * max(dot(N, CANDLE), 0.0) * flicker;
   float spec = pow(max(dot(reflect(-KEY, N), vec3(0.0, 0.0, 1.0)), 0.0), 60.0);
-  col += vec3(1.0, 0.95, 0.9) * spec * 0.7;
-  // red glow from the throat bleeding round the edges
-  col += vec3(0.5, 0.02, 0.02) * pow(abs(tt.y), 4.0) * glow * 0.6;
+  col += vec3(1.0, 0.95, 0.9) * spec * (0.6 + treble * 0.4);
+  // red glow from the throat bleeding round the edges, each tooth riding its own band
+  col += vec3(0.5, 0.02, 0.02) * pow(abs(tt.y), 4.0) * glow * (0.25 + bandV * 0.9);
   col *= mix(1.0, 0.35, depth);
   col *= 0.55 + 0.45 * smoothstep(-0.3, 0.15, t);
   // fresh blood coating the fangs
@@ -90,8 +107,8 @@ void main() {
 
   // ---- background: velvet gloom lit by a guttering candle ----
   float n = fbm(vec3(p * vec2(2.5, 1.2), time * 0.05));
-  vec3 col = vec3(0.025, 0.002, 0.008) + vec3(0.04, 0.002, 0.01) * smoothstep(-0.3, 0.6, n);
-  col += vec3(0.12, 0.04, 0.01) * flicker * exp(-length(p - vec2(0.0, -0.7)) * 2.5);
+  vec3 col = vec3(0.025, 0.002, 0.008) + (vec3(0.025, 0.002, 0.006) + satinC * 0.06) * smoothstep(-0.3, 0.6, n);
+  col += candle * 0.12 * flicker * exp(-length(p - vec2(0.0, -0.7)) * 2.5);
 
   // high cape collar (red satin inside, black outside)
   float cl = -0.48 - (p.y + 0.5) * 0.42 + 0.02 * sin(p.y * 6.0);
@@ -99,11 +116,13 @@ void main() {
   if (ax > 0.5 && cIn > 0.0) {
     float along = (ax - 0.5) * 6.0 + p.y * 2.0;
     float sheen = pow(0.5 + 0.5 * sin(along * 3.0 + p.y * 4.0), 3.0);
-    vec3 satin = vec3(0.12, 0.0, 0.012) + vec3(0.32, 0.01, 0.03) * sheen * (0.6 + 0.4 * flicker);
+    // a band of light ripples up the satin on every snare
+    float sweep = exp(-pow(p.y + 0.55 - (1.0 - snarl) * 1.1, 2.0) * 30.0) * snarl;
+    vec3 satin = satinC * 0.37 + satinC * (sheen * (0.6 + 0.4 * flicker) + sweep * 2.2);
     satin *= smoothstep(0.85, 0.55, ax) * 0.7 + 0.3;
     col = mix(col, satin, cIn);
     float rim = smoothstep(0.012, 0.0, abs(-ax - cl));
-    col += vec3(0.4, 0.05, 0.05) * rim * 0.4;
+    col += (satinC * 1.25 + vec3(0.05)) * rim * (0.4 + snarl * 1.2);
   }
 
   // ---- face: pale skin lit from below by the candle, fading into the dark ----
@@ -119,7 +138,7 @@ void main() {
     float light = exp(-dot((p - vec2(-0.05, MY - 0.06)) / vec2(0.75, 0.5), (p - vec2(-0.05, MY - 0.06)) / vec2(0.75, 0.5)) * 1.4);
     vec3 skin = vec3(0.1, 0.098, 0.12) * (0.25 + 0.75 * roundness) * (0.25 + 0.95 * light);
     skin *= 0.88 + 0.12 * fbm(vec3(p * 22.0, 1.0));
-    skin += vec3(0.07, 0.03, 0.008) * flicker * smoothstep(0.1, -0.45, p.y) * roundness * light;
+    skin += candle * 0.075 * flicker * smoothstep(0.1, -0.45, p.y) * roundness * light;
     // shadow under the lower lip and in the chin cleft
     float lowerOuter = yBotF(p.x) - (0.012 + 0.07 * pow(sEll(p.x), 1.3)) * pow(sEll(p.x), 0.55);
     skin *= 1.0 - 0.6 * exp(-max(lowerOuter - p.y, 0.0) * 22.0) * step(p.y, lowerOuter) * smoothstep(W * 1.05, 0.0, ax);
@@ -165,7 +184,7 @@ void main() {
       float g = yBotF(LX[i]) + 0.01 + gum * 0.6;
       gL = max(gL, 0.0);
       vec4 tt = tooth(ax, p.y, LX[i], LW[i], LL[i], g, -1.0, i == 2);
-      if (tt.x > 0.0) m = mix(m, shadeTooth(tt, sx, LX[i] / W, false), tt.x);
+      if (tt.x > 0.0) m = mix(m, shadeTooth(tt, sx, LX[i] / W, false, tband[i + 1]), tt.x);
     }
     // lower gum
     float lg = yB + 0.012 + gum * 0.6 + 0.006 * cos(ax * 110.0);
@@ -175,7 +194,7 @@ void main() {
       if (i == 2) continue;
       float g = yTopF(UX[i]) - 0.01 - gum;
       vec4 tt = tooth(ax, p.y, UX[i], UW[i], UL[i], g, 1.0, false);
-      if (tt.x > 0.0) m = mix(m, shadeTooth(tt, sx, UX[i] / W, true), tt.x);
+      if (tt.x > 0.0) m = mix(m, shadeTooth(tt, sx, UX[i] / W, true, tband[i]), tt.x);
     }
     col = mix(col, m, inMouth);
   }
@@ -206,7 +225,7 @@ void main() {
     float d = max(dot(N, KEY), 0.0);
     float sp = pow(max(dot(reflect(-KEY, N), vec3(0.0, 0.0, 1.0)), 0.0), 35.0);
     vec3 lc = lipBase * (0.25 + 0.95 * d) + vec3(1.0, 0.75, 0.75) * sp * 0.7;
-    lc += vec3(0.15, 0.05, 0.0) * max(dot(N, CANDLE), 0.0) * flicker * 0.3;
+    lc += candle * 0.15 * max(dot(N, CANDLE), 0.0) * flicker * 0.3;
     lc *= 0.55 + 0.45 * smoothstep(0.0, 0.25, t);
     float a = smoothstep(yB + px, yB - px, p.y) * smoothstep(yLo - px, yLo + px, p.y);
     col = mix(col, lc, a);
@@ -219,7 +238,7 @@ void main() {
     float a = tt.x * step(p.y, yT + 0.002);
     if (a > 0.0) {
       // soft shadow cast onto the lower lip
-      col = mix(col, shadeTooth(tt, sx, 0.0, true), a);
+      col = mix(col, shadeTooth(tt, sx, 0.0, true, tband[2]), a);
     } else {
       vec4 sh = tooth(ax - 0.006, p.y + 0.008, UX[2], UW[2] * 1.2, UL[2], g, 1.0, true);
       col *= 1.0 - 0.45 * sh.x * step(p.y, yB);
@@ -228,6 +247,13 @@ void main() {
 
   // chomp flash
   col += vec3(0.25, 0.0, 0.01) * dropPulse * dropPulse * exp(-length(p) * 2.0);
+  // hi-hat glint: a four-point star catching the light on a tooth
+  if (glint > 0.001) {
+    vec2 gq = p - glintPos;
+    float star = exp(-length(gq) * 120.0) * 1.5;
+    star += exp(-abs(gq.x) * 700.0) * exp(-abs(gq.y) * 28.0) + exp(-abs(gq.y) * 700.0) * exp(-abs(gq.x) * 28.0);
+    col += mix(vec3(1.0, 0.97, 0.92), candle, 0.35) * star * glint * 1.4;
+  }
   col *= 1.0 - 0.55 * dot(p, p);
   gl_FragColor = vec4(col, 1.0);
 }
@@ -315,6 +341,18 @@ export class DraculaFangsVisual extends Visual {
   private glow = 0.6;
   private shake = new THREE.Vector2();
   private ortho = new THREE.OrthographicCamera(-0.5, 0.5, 0.5, -0.5, -1, 1);
+  private candle = new THREE.Color();
+  private satin = new THREE.Color();
+  private glintPos = new THREE.Vector2();
+  private tband = new Array<number>(7).fill(0);
+  private mood = 0;
+  private moodFrom = 0;
+  private moodMix = 1;
+  private moodSpeed = 0.4;
+  private beatsInMood = 0;
+  private snarl = 0;
+  private glint = 0;
+  private flick = 0;
 
   protected setup() {
     this.camera = this.ortho;
@@ -332,6 +370,13 @@ export class DraculaFangsVisual extends Visual {
       blood: { value: 0.2 },
       flicker: { value: 1 },
       px: { value: 0.001 },
+      snarl: { value: 0 },
+      glint: { value: 0 },
+      treble: { value: 0 },
+      candle: { value: this.candle },
+      satinC: { value: this.satin },
+      glintPos: { value: this.glintPos },
+      tband: { value: this.tband },
     });
     this.scene.add(this.quad);
 
@@ -493,22 +538,74 @@ export class DraculaFangsVisual extends Visual {
     this.splatIdx = (this.splatIdx + 1) % SPLATS;
   }
 
+  private launchBat(i: number, aspect: number, delay: number) {
+    this.batAge[i] = 0;
+    this.batDelay[i] = delay;
+    const a = Math.random() * Math.PI * 2;
+    const sp = 0.25 + Math.random() * 0.5;
+    this.batVel[i * 2] = Math.cos(a) * sp * aspect * 0.8;
+    this.batVel[i * 2 + 1] = Math.sin(a) * sp * 0.6 + 0.1;
+    this.batPhase[i] = Math.random() * 10;
+  }
+
+  private updateMood(dt: number, audio: AudioFeatures) {
+    if (audio.beat) this.beatsInMood++;
+    if (audio.drop || this.beatsInMood >= 32) {
+      this.moodFrom = this.mood;
+      this.mood = (this.mood + 1 + (audio.drop ? Math.floor(Math.random() * 2) : 0)) % MOODS.length;
+      this.moodMix = 0;
+      this.moodSpeed = audio.drop ? 2.5 : 0.35;
+      this.beatsInMood = 0;
+    }
+    this.moodMix = Math.min(1, this.moodMix + dt * this.moodSpeed);
+    const m = this.moodMix * this.moodMix * (3 - 2 * this.moodMix);
+    const [fc, fs] = MOODS[this.moodFrom];
+    const [tc, ts] = MOODS[this.mood];
+    this.candle.copy(fc).lerp(tc, m);
+    this.satin.copy(fs).lerp(ts, m);
+    // brighter, airier music burns the candle hotter and whiter
+    this.candle.lerp(HOT_CANDLE, audio.brightness * 0.4);
+  }
+
   update(dt: number, time: number, audio: AudioFeatures) {
     dt = Math.min(dt, 0.05);
     const aspect = this.width / this.height;
+    this.updateMood(dt, audio);
+    // snares make him snarl (lip curls, satin lights up), hats glint off the teeth
+    if (audio.midHit) {
+      this.snarl = 1;
+      if (audio.midHitCount % 4 === 0) {
+        this.splatAt((Math.random() - 0.5) * aspect * 0.9, (Math.random() - 0.5) * 0.85, 0.018 + Math.random() * 0.025, time);
+      }
+      if (Math.random() < 0.35) {
+        for (let i = 0; i < BATS; i++) {
+          if (this.batAge[i] > 3.2) {
+            this.launchBat(i, aspect, 0);
+            break;
+          }
+        }
+      }
+    }
+    this.snarl = Math.max(0, this.snarl - dt * 2.2);
+    if (audio.trebleHit) {
+      this.glint = 1;
+      const side = Math.random() < 0.5 ? -1 : 1;
+      const u = this.quad.material.uniforms;
+      const k = u.open.value > 0.35 && Math.random() < 0.5 ? Math.floor(Math.random() * UX.length) : 2;
+      const g = yTop(UX[k], u.open.value) - 0.01 - u.gum.value;
+      this.glintPos.set(side * (UX[k] - (k === 2 ? 0.006 : 0)), g - UL[k] * (k === 2 ? 0.55 + Math.random() * 0.35 : 0.7));
+    }
+    this.glint = Math.max(0, this.glint - dt * 3.5);
+    for (let i = 0; i < 7; i++) {
+      const v = audio.bands[TOOTH_BANDS[i]];
+      this.tband[i] = damp(this.tband[i], v, v > this.tband[i] ? 18 : 5, dt);
+    }
+    this.flick = damp(this.flick, audio.treble, 10, dt);
     // jaw: opens with the bass, snaps shut on beats, chomps on drops then gapes wide
     if (audio.drop) {
       this.chomp = 1;
       this.wide = 1;
-      for (let i = 0; i < BATS; i++) {
-        this.batAge[i] = 0;
-        this.batDelay[i] = 0.18 + Math.random() * 0.9;
-        const a = Math.random() * Math.PI * 2;
-        const sp = 0.25 + Math.random() * 0.5;
-        this.batVel[i * 2] = Math.cos(a) * sp * aspect * 0.8;
-        this.batVel[i * 2 + 1] = Math.sin(a) * sp * 0.6 + 0.1;
-        this.batPhase[i] = Math.random() * 10;
-      }
+      for (let i = 0; i < BATS; i++) this.launchBat(i, aspect, 0.18 + Math.random() * 0.9);
       for (let k = 0; k < 7; k++) {
         this.splatAt((Math.random() - 0.5) * aspect * 0.95, (Math.random() - 0.5) * 0.9, 0.04 + Math.random() * 0.08, time + 0.12 + k * 0.03);
       }
@@ -516,7 +613,7 @@ export class DraculaFangsVisual extends Visual {
     this.chomp = Math.max(0, this.chomp - dt * 3.2);
     this.wide = damp(this.wide, 0, 0.5, dt);
     const snap = audio.beatPulse * audio.beatPulse * 0.7;
-    const target = Math.min(1.15, 0.18 + audio.bass * 0.75 + this.wide * 0.5);
+    const target = Math.min(1.15, 0.18 + audio.bass * 0.75 + this.wide * 0.5 + this.snarl * 0.14);
     this.open = damp(this.open, target, 10, dt);
     const chompClose = this.chomp > 0.6 ? 1 : this.chomp / 0.6;
     const shownOpen = Math.max(0, this.open * (1 - snap) * (1 - chompClose));
@@ -524,20 +621,24 @@ export class DraculaFangsVisual extends Visual {
     this.glow = damp(this.glow, 0.45 + audio.bass * 0.5 + audio.dropPulse * 0.6, 4, dt);
 
     // shake on chomp
-    const sh = audio.dropPulse * 0.012 + audio.beatPulse * 0.002;
+    const sh = audio.dropPulse * 0.012 + audio.beatPulse * 0.002 + audio.midPulse * 0.0015;
     this.shake.set((Math.random() - 0.5) * sh, (Math.random() - 0.5) * sh);
     this.ortho.position.set(this.shake.x, this.shake.y, 0);
 
     const u = this.quad.material.uniforms;
     u.time.value = time;
     u.open.value = shownOpen;
-    u.gum.value = damp(u.gum.value, 0.004 + audio.bass * 0.012 + this.wide * 0.012, 6, dt);
+    u.gum.value = damp(u.gum.value, 0.004 + audio.bass * 0.012 + this.wide * 0.012 + this.snarl * 0.016, 10, dt);
     u.bass.value = audio.bass;
     u.beatPulse.value = audio.beatPulse;
     u.dropPulse.value = audio.dropPulse;
     u.glow.value = this.glow;
     u.blood.value = this.blood;
-    u.flicker.value = 0.85 + 0.1 * Math.sin(time * 9.1) * Math.sin(time * 5.3) + 0.08 * Math.sin(time * 23.7);
+    u.flicker.value =
+      0.85 + 0.1 * Math.sin(time * 9.1) * Math.sin(time * 5.3) + 0.08 * Math.sin(time * 23.7) + this.flick * 0.12 * Math.sin(time * 41.3);
+    u.snarl.value = this.snarl;
+    u.glint.value = this.glint * this.glint;
+    u.treble.value = this.flick;
 
     // blood forming at the fang tips
     for (let s = 0; s < 2; s++) {
@@ -559,7 +660,7 @@ export class DraculaFangsVisual extends Visual {
         this.tipRate[s] = 0.35 + Math.random() * 0.5;
       }
     }
-    if (audio.beat && audio.bass > 0.3) {
+    if ((audio.beat && audio.bass > 0.3) || audio.midHit) {
       // a little spray off the fangs
       for (let k = 0; k < 3; k++) {
         const tp = this.tip(Math.random() < 0.5 ? -1 : 1);

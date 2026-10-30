@@ -2,14 +2,25 @@ import * as THREE from 'three';
 import type { AudioFeatures } from '../audio/features';
 import { FULLSCREEN_VERT, GLSL_NOISE } from '../core/glsl';
 import { PALETTE } from '../core/palette';
-import { ghostTexture } from '../core/shapes';
+import { dotTexture, ghostTexture } from '../core/shapes';
 import { Visual, damp, fullscreenQuad } from '../core/Visual';
 
 const COUNT = 170;
 const HALF = 12;
 const Z_MIN = -16;
 const Z_MAX = 9;
-const COLORS = [PALETTE.ghost, PALETTE.ghost, PALETTE.bone, new THREE.Color(0xc9a0ff), PALETTE.slime];
+const MOTES = 700;
+const BOOS_PER_SNARE = 22;
+const SPARKS_PER_HAT = 90;
+const C = (hex: number) => new THREE.Color(hex);
+/** Ghost colour schemes (5 slots, slot 4 is the rare accent); cycled every 32 beats and on drops. */
+const SCHEMES: THREE.Color[][] = [
+  [PALETTE.ghost.clone(), PALETTE.ghost.clone(), PALETTE.bone.clone(), C(0xc9a0ff), PALETTE.slime.clone()],
+  [C(0x7fe8ff), C(0x30d8ff), C(0x00e0c0), C(0x6a80ff), C(0xc060ff)],
+  [C(0xc9a0ff), C(0xff6ad5), C(0x9b30ff), C(0xff2fb0), C(0x7fe8ff)],
+  [C(0x7cff3a), C(0xb0ff90), C(0xbfe9ff), C(0x00e0a0), C(0xd0ff40)],
+  [C(0xff9a40), C(0xffc070), C(0xff4a20), C(0xffd040), C(0xff6ad5)],
+];
 
 /** 4. Ghosts drifting through a divergence-free (ABC) flow field, leaving afterimage trails. */
 export class GhostFlowVisual extends Visual {
@@ -29,6 +40,16 @@ export class GhostFlowVisual extends Visual {
   private phase = new Float32Array(COUNT);
   private size = new Float32Array(COUNT);
   private colorIdx = new Uint8Array(COUNT);
+  private boo = new Float32Array(COUNT);
+  private motes!: THREE.Points<THREE.BufferGeometry, THREE.PointsMaterial>;
+  private moteSpark = new Float32Array(MOTES);
+  private cols = [new THREE.Color(), new THREE.Color(), new THREE.Color(), new THREE.Color(), new THREE.Color()];
+  private bgTint = new THREE.Color();
+  private scheme = 0;
+  private schemeFrom = 0;
+  private schemeMix = 1;
+  private schemeSpeed = 0.35;
+  private beatsInScheme = 0;
   private swirl = 0;
   private flowTime = 0;
   private dummy = new THREE.Object3D();
@@ -45,6 +66,7 @@ export class GhostFlowVisual extends Visual {
     this.bg = fullscreenQuad(
       /* glsl */ `
       uniform float time, bass, drop, aspect;
+      uniform vec3 tint, accent;
       varying vec2 vUv;
       ${GLSL_NOISE}
       void main() {
@@ -52,14 +74,14 @@ export class GhostFlowVisual extends Visual {
         float n = fbm(vec3(p * 1.6 + vec2(0.0, time * 0.03), time * 0.05));
         float n2 = fbm(vec3(p * 3.5 - vec2(time * 0.02, 0.0), time * 0.07 + 5.0));
         vec3 col = vec3(0.008, 0.012, 0.03);
-        col += vec3(0.05, 0.07, 0.13) * smoothstep(-0.3, 0.8, n) * (0.7 + bass * 0.6);
+        col += tint * smoothstep(-0.3, 0.8, n) * (0.7 + bass * 0.6);
         col += vec3(0.06, 0.03, 0.1) * smoothstep(0.0, 0.9, n2);
         col += vec3(0.2, 0.25, 0.3) * exp(-length(p - vec2(0.0, 0.55)) * 3.0) * 0.4;
-        col = mix(col, col * vec3(0.6, 1.6, 0.7), drop);
+        col = mix(col, col * (0.5 + accent * 1.2), drop);
         col *= 1.0 - 0.6 * dot(p, p);
         gl_FragColor = vec4(col, 1.0);
       }`,
-      { time: { value: 0 }, bass: { value: 0 }, drop: { value: 0 }, aspect: { value: 1 } },
+      { time: { value: 0 }, bass: { value: 0 }, drop: { value: 0 }, aspect: { value: 1 }, tint: { value: this.bgTint }, accent: { value: this.cols[4] } },
     );
     this.scene.add(this.bg);
 
@@ -103,14 +125,39 @@ export class GhostFlowVisual extends Visual {
       COUNT,
     );
     this.mesh.frustumCulled = false;
+    this.updateScheme(0, null);
     for (let i = 0; i < COUNT; i++) {
       this.spawn(i, Z_MIN + Math.random() * (Z_MAX - Z_MIN));
       this.phase[i] = Math.random() * 100;
       this.size[i] = 0.6 + Math.random() * 0.9;
       this.colorIdx[i] = Math.random() < 0.08 ? 4 : Math.floor(Math.random() * 4);
-      this.mesh.setColorAt(i, COLORS[this.colorIdx[i]]);
+      this.mesh.setColorAt(i, this.cols[this.colorIdx[i]]);
     }
     this.ghostScene.add(this.mesh);
+
+    // Ectoplasm motes drifting in the same flow; hi-hats make them sparkle (and leave glittery trails).
+    const mp = new Float32Array(MOTES * 3);
+    for (let i = 0; i < MOTES; i++) {
+      mp[i * 3] = (Math.random() - 0.5) * HALF * 2;
+      mp[i * 3 + 1] = (Math.random() - 0.5) * HALF * 1.5;
+      mp[i * 3 + 2] = Z_MIN + Math.random() * (Z_MAX - Z_MIN);
+    }
+    const mg = new THREE.BufferGeometry();
+    mg.setAttribute('position', new THREE.BufferAttribute(mp, 3));
+    mg.setAttribute('color', new THREE.BufferAttribute(new Float32Array(MOTES * 3), 3));
+    this.motes = new THREE.Points(
+      mg,
+      new THREE.PointsMaterial({
+        size: 0.13,
+        map: dotTexture(),
+        vertexColors: true,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      }),
+    );
+    this.motes.frustumCulled = false;
+    this.ghostScene.add(this.motes);
     this.renderer.compile(this.ghostScene, this.camera);
     this.renderer.compile(this.fbScene, this.camera);
   }
@@ -140,7 +187,30 @@ export class GhostFlowVisual extends Visual {
     this.needsClear = true;
   }
 
+  private updateScheme(dt: number, audio: AudioFeatures | null) {
+    if (audio) {
+      if (audio.beat) this.beatsInScheme++;
+      if (audio.drop || this.beatsInScheme >= 32) {
+        this.schemeFrom = this.scheme;
+        this.scheme = (this.scheme + 1 + (audio.drop ? Math.floor(Math.random() * 2) : 0)) % SCHEMES.length;
+        this.schemeMix = 0;
+        this.schemeSpeed = audio.drop ? 2.5 : 0.35;
+        this.beatsInScheme = 0;
+      }
+    }
+    this.schemeMix = Math.min(1, this.schemeMix + dt * this.schemeSpeed);
+    const m = this.schemeMix * this.schemeMix * (3 - 2 * this.schemeMix);
+    for (let k = 0; k < 5; k++) this.cols[k].copy(SCHEMES[this.schemeFrom][k]).lerp(SCHEMES[this.scheme][k], m);
+    // the mist leans toward the scheme's colours as the music gets brighter
+    this.bgTint.setRGB(0.05, 0.07, 0.13).lerp(this.tmpColor.copy(this.cols[3]).multiplyScalar(0.12), 0.25 + (audio ? audio.brightness : 0) * 0.5);
+  }
+
   update(dt: number, time: number, audio: AudioFeatures) {
+    this.updateScheme(dt, audio);
+    if (audio.midHit) {
+      for (let k = 0; k < BOOS_PER_SNARE; k++) this.boo[Math.floor(Math.random() * COUNT)] = 1;
+    }
+    const booDecay = Math.exp(-2.5 * dt);
     if (audio.beat) this.swirl = Math.min(1.5, this.swirl + 0.8);
     this.swirl = damp(this.swirl, 0, 2.5, dt);
     const speed = 0.4 + audio.level * 1.6 + audio.bass * 0.8;
@@ -191,9 +261,12 @@ export class GhostFlowVisual extends Visual {
       }
 
       const ph = this.phase[i] + time;
-      const sz = this.size[i] * (1 + audio.bass * 0.25 + Math.sin(ph * 2.0) * 0.06);
+      // a snare makes a handful of ghosts lunge and flare ("boo!")
+      const boo = (this.boo[i] *= booDecay);
+      const band = audio.bands[4 + Math.min(47, Math.max(0, Math.floor(((x + HALF) / (HALF * 2)) * 48)))];
+      const sz = this.size[i] * (1 + audio.bass * 0.25 + band * 0.15 + boo * 0.45 + Math.sin(ph * 2.0) * 0.06);
       this.roll.setFromAxisAngle(this.zAxis, -this.vel[b] * 0.06 + Math.sin(ph * 1.3) * 0.15);
-      this.dummy.position.set(this.pos[b], this.pos[b + 1] + Math.sin(ph * 1.7) * 0.15, this.pos[b + 2]);
+      this.dummy.position.set(this.pos[b] + Math.sin(ph * 31) * boo * 0.08, this.pos[b + 1] + Math.sin(ph * 1.7) * 0.15 + boo * 0.35, this.pos[b + 2]);
       this.dummy.quaternion.copy(cam.quaternion).multiply(this.roll);
       this.dummy.scale.set(sz, sz * 1.15, 1);
       this.dummy.updateMatrix();
@@ -202,12 +275,43 @@ export class GhostFlowVisual extends Visual {
       // Fade in at the far end, fade out right before reaching the camera.
       const fade = Math.min(1, (this.pos[b + 2] - Z_MIN) / 4) * Math.min(1, (Z_MAX - this.pos[b + 2]) / 3);
       const shimmer = 0.75 + 0.25 * Math.sin(time * 24 + this.phase[i] * 13) * audio.treble;
-      const bright = (0.09 + audio.mid * 0.04 + audio.beatPulse * 0.05) * shimmer * Math.max(0, fade);
-      this.tmpColor.copy(COLORS[this.colorIdx[i]]).lerp(PALETTE.slime, audio.dropPulse * 0.7).multiplyScalar(bright);
+      const bright = (0.07 + band * 0.05 + audio.mid * 0.03 + audio.beatPulse * 0.05 + boo * 0.14) * shimmer * Math.max(0, fade);
+      this.tmpColor
+        .copy(this.cols[this.colorIdx[i]])
+        .lerp(this.cols[4], Math.min(1, audio.dropPulse * 0.7 + boo * 0.5))
+        .multiplyScalar(bright);
       this.mesh.setColorAt(i, this.tmpColor);
     }
     this.mesh.instanceMatrix.needsUpdate = true;
     this.mesh.instanceColor!.needsUpdate = true;
+
+    if (audio.trebleHit) {
+      for (let k = 0; k < SPARKS_PER_HAT; k++) this.moteSpark[Math.floor(Math.random() * MOTES)] = 1;
+    }
+    const sparkDecay = Math.exp(-5 * dt);
+    const mpos = this.motes.geometry.attributes.position.array as Float32Array;
+    const mcol = this.motes.geometry.attributes.color.array as Float32Array;
+    const mspeed = 0.6 + audio.treble * 1.2;
+    for (let i = 0; i < MOTES; i++) {
+      const b = i * 3;
+      const x = mpos[b], y = mpos[b + 1], z = mpos[b + 2];
+      mpos[b] += (Math.sin(k * z + ft) + Math.cos(k * y)) * mspeed * dt;
+      mpos[b + 1] += (0.8 * Math.sin(k * x) + Math.cos(k * z + ft * 1.3)) * mspeed * dt;
+      mpos[b + 2] += (0.6 * (Math.sin(k * y) + Math.cos(k * x)) * mspeed + 0.6 + this.swirl * 3) * dt;
+      if (mpos[b] > HALF) mpos[b] -= HALF * 2;
+      else if (mpos[b] < -HALF) mpos[b] += HALF * 2;
+      if (mpos[b + 1] > HALF * 0.75) mpos[b + 1] -= HALF * 1.5;
+      else if (mpos[b + 1] < -HALF * 0.75) mpos[b + 1] += HALF * 1.5;
+      if (mpos[b + 2] > Z_MAX) mpos[b + 2] = Z_MIN;
+      const s = (this.moteSpark[i] *= sparkDecay);
+      const c = this.cols[i % 5];
+      const v = 0.07 + audio.treble * 0.06 + s * 0.6;
+      mcol[b] = c.r * v;
+      mcol[b + 1] = c.g * v;
+      mcol[b + 2] = c.b * v;
+    }
+    this.motes.geometry.attributes.position.needsUpdate = true;
+    this.motes.geometry.attributes.color.needsUpdate = true;
 
     this.fbMat.uniforms.decay.value = Math.min(0.9, 0.78 + audio.level * 0.1);
     this.fbMat.uniforms.zoom.value = 0.999 - audio.beatPulse * 0.006;
@@ -248,5 +352,7 @@ export class GhostFlowVisual extends Visual {
     this.mesh.geometry.dispose();
     this.mesh.material.dispose();
     this.fbMat.dispose();
+    this.motes.geometry.dispose();
+    this.motes.material.dispose();
   }
 }

@@ -1,15 +1,24 @@
 import * as THREE from 'three';
 import type { AudioFeatures } from '../audio/features';
 import { GLSL_NOISE } from '../core/glsl';
-import { PALETTE, glslColor } from '../core/palette';
 import { batTexture } from '../core/shapes';
-import { Visual, damp, fullscreenQuad } from '../core/Visual';
+import { SpectrumTexture, Visual, damp, fullscreenQuad } from '../core/Visual';
 
 const BATS = 800;
 const ATTRACTORS = 6;
 const CAM_Z = 12;
 const FOV = 55;
 const MOON = { x: 0, y: 0.1, r: 0.4 };
+
+const C = (r: number, g: number, b: number) => new THREE.Color(r, g, b);
+/** Night moods: [moon, sky, bat eyes, accent (lightning / hats)]. The blood-red moon stays reserved for drops. */
+const MOODS: THREE.Color[][] = [
+  [C(0.62, 0.545, 0.33), C(0.05, 0.012, 0.09), C(2.5, 0.25, 0.05), C(0.55, 0.3, 1.0)], // bone moon, amber eyes
+  [C(0.42, 0.62, 0.72), C(0.006, 0.022, 0.055), C(0.35, 2.6, 0.25), C(0.3, 0.9, 1.0)], // ghost moon, toxic eyes
+  [C(0.4, 0.66, 0.16), C(0.015, 0.045, 0.02), C(2.6, 0.2, 1.4), C(0.5, 1.0, 0.2)], // toxic moon, magenta eyes
+  [C(0.5, 0.3, 0.78), C(0.06, 0.008, 0.11), C(0.25, 1.9, 2.6), C(1.0, 0.3, 0.8)], // violet moon, cyan eyes
+  [C(0.85, 0.4, 0.1), C(0.06, 0.012, 0.025), C(2.6, 1.9, 0.2), C(1.0, 0.5, 0.1)], // harvest moon, gold eyes
+];
 
 /** 9. A swirling storm of bats around a huge full moon. */
 export class BatStormVisual extends Visual {
@@ -30,6 +39,19 @@ export class BatStormVisual extends Visual {
   private red = 0;
   private lastBeat = -1;
   private beatInterval = 0.5;
+  private spectrum = new SpectrumTexture(64);
+  private mood = [new THREE.Color(), new THREE.Color(), new THREE.Color(), new THREE.Color()];
+  private moodIdx = 0;
+  private moodFrom = 0;
+  private moodMix = 1;
+  private moodSpeed = 0.35;
+  private lastMoodBeat = 0;
+  private flash = 0;
+  private flock = 0;
+  private kick = 0;
+  private sparkle = 0;
+  private flashPos = new THREE.Vector2();
+  private tmp = new THREE.Vector3();
 
   protected setup() {
     this.uniforms = {
@@ -38,11 +60,21 @@ export class BatStormVisual extends Visual {
       red: { value: 0 },
       bass: { value: 0 },
       beat: { value: 0 },
+      moonC: { value: this.mood[0] },
+      skyC: { value: this.mood[1] },
+      accent: { value: this.mood[3] },
+      flash: { value: 0 },
+      flashPos: { value: this.flashPos },
+      mid: { value: 0 },
+      sparkle: { value: 0 },
+      seed: { value: 0 },
     };
     this.scene.add(
       fullscreenQuad(
         /* glsl */ `
-        uniform float time, aspect, red, bass, beat;
+        uniform float time, aspect, red, bass, beat, flash, mid, sparkle, seed;
+        uniform vec3 moonC, skyC, accent;
+        uniform vec2 flashPos;
         varying vec2 vUv;
         ${GLSL_NOISE}
         float fbm4(vec3 p) {
@@ -55,10 +87,19 @@ export class BatStormVisual extends Visual {
           vec2 mc = vec2(${MOON.x.toFixed(2)}, ${MOON.y.toFixed(2)});
           float R = ${MOON.r.toFixed(2)} * (1.0 + bass * 0.025);
           float d = length(p - mc);
-          vec3 moonCol = mix(${glslColor(PALETTE.moon)} * 0.62, vec3(0.95, 0.04, 0.03), red);
-          vec3 sky = mix(vec3(0.05, 0.012, 0.09), vec3(0.008, 0.002, 0.02), smoothstep(-1.0, 1.0, p.y));
+          vec3 moonCol = mix(moonC, vec3(0.95, 0.04, 0.03), red);
+          vec3 sky = mix(skyC, skyC * 0.17, smoothstep(-1.0, 1.0, p.y));
           sky = mix(sky, vec3(0.1, 0.0, 0.02), red * 0.6);
           vec3 col = sky;
+          // stars: a few flare on every hi-hat
+          vec2 sg = p * 60.0;
+          vec2 sc = floor(sg);
+          float sh = hash21(sc);
+          if (sh > 0.93) {
+            vec2 sp = fract(sg) - 0.5 - (hash22(sc) - 0.5) * 0.6;
+            float tw = 0.25 + 0.2 * sin(time * 2.0 + sh * 80.0) + sparkle * step(0.6, hash21(sc + seed)) * 1.6;
+            col += mix(vec3(0.7, 0.75, 0.9), accent, 0.4) * smoothstep(0.12, 0.0, length(sp)) * tw * smoothstep(-0.6, 0.4, p.y) * 0.5;
+          }
           col += moonCol * exp(-max(d - R, 0.0) * 4.0) * 0.12;
           col += moonCol * exp(-max(d - R, 0.0) * 16.0) * 0.12;
           if (d < R + 0.01) {
@@ -76,8 +117,12 @@ export class BatStormVisual extends Visual {
           float n = fbm4(vec3(cp, time * 0.03));
           float dens = smoothstep(0.05, 0.55, n) * smoothstep(0.75, -0.2, p.y);
           float lit = exp(-max(d - R, 0.0) * 2.0);
-          vec3 cloud = mix(vec3(0.025, 0.008, 0.05), moonCol * 0.4, lit);
+          vec3 cloud = mix(skyC * 0.5, moonCol * 0.4, lit) * (1.0 + mid * 0.35);
+          // snare lightning flickering inside the clouds where a flock is scattered
+          float fl = exp(-length((p - flashPos) * vec2(0.7, 1.2)) * 1.8) * flash;
+          cloud += accent * fl * (0.4 + 1.0 * smoothstep(0.0, 0.6, n)) * 2.2;
           col = mix(col, cloud * (0.6 + 0.4 * n), dens * 0.85);
+          col += accent * (fl * 0.22 + fl * fl * 0.25);
           gl_FragColor = vec4(col, 1.0);
         }`,
         this.uniforms,
@@ -86,22 +131,44 @@ export class BatStormVisual extends Visual {
 
     const geo = new THREE.PlaneGeometry(1, 1, 10, 1);
     const phase = new Float32Array(BATS * 2);
+    const info = new Float32Array(BATS * 2);
     for (let i = 0; i < BATS; i++) {
       phase[i * 2] = Math.random() * Math.PI * 2;
       phase[i * 2 + 1] = 0.8 + Math.random() * 0.4;
+      info[i * 2] = 0.03 + Math.random() * 0.8; // spectrum band its eyes follow
+      info[i * 2 + 1] = i % ATTRACTORS;
     }
     geo.setAttribute('aPhase', new THREE.InstancedBufferAttribute(phase, 2));
-    this.batUniforms = { map: { value: batTexture() }, flapTime: { value: 0 }, eyes: { value: 0 }, red: { value: 0 } };
+    geo.setAttribute('aInfo', new THREE.InstancedBufferAttribute(info, 2));
+    this.batUniforms = {
+      map: { value: batTexture() },
+      flapTime: { value: 0 },
+      eyes: { value: 0 },
+      red: { value: 0 },
+      eyeC: { value: this.mood[2] },
+      accent: { value: this.mood[3] },
+      tSpectrum: { value: this.spectrum.texture },
+      flock: { value: 0 },
+      flockFlash: { value: 0 },
+      sparkle: { value: 0 },
+      seed: { value: 0 },
+    };
     this.bats = new THREE.InstancedMesh(
       geo,
       new THREE.ShaderMaterial({
         uniforms: this.batUniforms,
         vertexShader: /* glsl */ `
-          uniform float flapTime;
-          attribute vec2 aPhase;
+          uniform float flapTime, flock, flockFlash, sparkle, seed;
+          uniform sampler2D tSpectrum;
+          attribute vec2 aPhase, aInfo;
           varying vec2 vUv;
+          varying float vEye, vGlint;
           void main() {
             vUv = uv;
+            float band = texture2D(tSpectrum, vec2(aInfo.x, 0.5)).r;
+            float hit = 1.0 - step(0.5, abs(aInfo.y - flock));
+            vEye = 0.45 + band * 1.1 + hit * flockFlash * 2.0;
+            vGlint = step(0.9, fract(sin(aPhase.x * 91.7 + seed) * 43758.5453)) * sparkle;
             vec3 p = position;
             float flap = sin(flapTime * aPhase.y + aPhase.x);
             float ax = abs(p.x);
@@ -113,14 +180,17 @@ export class BatStormVisual extends Visual {
         fragmentShader: /* glsl */ `
           uniform sampler2D map;
           uniform float eyes, red;
+          uniform vec3 eyeC, accent;
           varying vec2 vUv;
+          varying float vEye, vGlint;
           void main() {
             float a = texture2D(map, vUv).a;
             if (a < 0.02) discard;
             vec3 col = vec3(0.012, 0.004, 0.02);
             vec2 e = vec2(abs(vUv.x - 0.5) - 0.022, vUv.y - 0.565);
             float eye = smoothstep(0.02, 0.0, length(e));
-            col += mix(vec3(2.5, 0.25, 0.05), vec3(3.0, 0.05, 0.05), red) * eye * eyes;
+            col += mix(eyeC, vec3(3.0, 0.05, 0.05), red) * eye * eyes * vEye;
+            col += mix(vec3(1.6), accent * 2.0, 0.5) * eye * vGlint;
             gl_FragColor = vec4(col, a);
           }`,
         transparent: true,
@@ -156,6 +226,29 @@ export class BatStormVisual extends Visual {
     }
   }
 
+  onEnter() {
+    this.moodMix = 1;
+    this.applyMood(0, 0);
+  }
+
+  private nextMood(speed: number, jump = 1) {
+    this.moodFrom = this.moodIdx;
+    this.moodIdx = (this.moodIdx + jump) % MOODS.length;
+    this.moodMix = 0;
+    this.moodSpeed = speed;
+  }
+
+  private applyMood(dt: number, brightness: number) {
+    this.moodMix = Math.min(1, this.moodMix + dt * this.moodSpeed);
+    const m = this.moodMix * this.moodMix * (3 - 2 * this.moodMix);
+    const a = MOODS[this.moodFrom];
+    const b = MOODS[this.moodIdx];
+    for (let k = 0; k < 4; k++) this.mood[k].copy(a[k]).lerp(b[k], m);
+    // brighter, airier music tints the moon and sky toward the accent
+    this.mood[0].lerp(this.mood[3], brightness * 0.22);
+    this.mood[1].lerp(this.mood[3], brightness * 0.04);
+  }
+
   resize(w: number, h: number) {
     super.resize(w, h);
     if (this.uniforms) this.uniforms.aspect.value = w / h;
@@ -177,6 +270,36 @@ export class BatStormVisual extends Visual {
     this.flapTime += this.flapRate * dt;
     this.speed = damp(this.speed, 2.5 + audio.level * 6 + audio.dropPulse * 4, 3, dt);
     this.red = damp(this.red, audio.dropPulse > 0.15 ? 1 : 0, audio.dropPulse > 0.15 ? 6 : 0.6, dt);
+
+    if (audio.drop) {
+      this.nextMood(2.5, 1 + Math.floor(Math.random() * 2));
+      this.lastMoodBeat = audio.beatCount;
+    } else if (audio.beat && audio.beatCount - this.lastMoodBeat >= 32) {
+      this.nextMood(0.35);
+      this.lastMoodBeat = audio.beatCount;
+    }
+    this.applyMood(dt, audio.brightness);
+    this.spectrum.update(audio.bands);
+
+    // snare: one flock scatters and lightning flickers in the clouds behind it
+    if (audio.midHit) {
+      this.flock = audio.midHitCount % ATTRACTORS;
+      this.kick = 4 + audio.mid * 6;
+      this.flash = 0.7 + audio.mid * 0.5;
+      const k = this.flock * 3;
+      this.tmp.set(this.attr[k], this.attr[k + 1], this.attr[k + 2]).project(this.camera);
+      this.flashPos.set(this.tmp.x * this.uniforms.aspect.value, Math.max(-0.3, this.tmp.y));
+    }
+    const kick = this.kick;
+    this.kick = 0;
+    this.flash *= Math.exp(-5 * dt);
+    const flicker = this.flash * (0.7 + 0.3 * Math.sin(time * 70) * Math.sin(time * 23));
+    // hats: re-seed which stars and bat eyes glint
+    if (audio.trebleHit) {
+      this.sparkle = Math.min(1.3, this.sparkle + 0.6 + audio.treble * 0.6);
+      this.uniforms.seed.value = this.batUniforms.seed.value = Math.random() * 100;
+    }
+    this.sparkle = damp(this.sparkle, audio.treble * 0.2, 6, dt);
 
     const c = this.center;
     for (let k = 0; k < ATTRACTORS; k++) {
@@ -224,6 +347,15 @@ export class BatStormVisual extends Visual {
       vx += ax * dt;
       vy += ay * dt;
       vz += az * dt;
+      if (kick > 0 && k === this.flock * 3) {
+        // scatter outward from the flock's attractor with a swirl
+        const ox = x - this.attr[k], oy = y - this.attr[k + 1], oz = z - this.attr[k + 2];
+        const ol = Math.sqrt(ox * ox + oy * oy + oz * oz) + 0.3;
+        const kb = kick * (0.6 + 0.8 * ((i * 0.381) % 1));
+        vx += ((ox - oy) / ol) * kb;
+        vy += ((oy + ox) / ol) * kb;
+        vz += (oz / ol) * kb * 0.5;
+      }
       if (burst > 0) {
         const b = burst * (0.6 + 0.8 * ((i * 0.618) % 1));
         vx += (dx / dist) * b;
@@ -284,5 +416,11 @@ export class BatStormVisual extends Visual {
     this.batUniforms.flapTime.value = this.flapTime;
     this.batUniforms.eyes.value = 0.35 + audio.beatPulse * 0.8 + this.red * 0.6;
     this.batUniforms.red.value = this.red;
+    this.batUniforms.flock.value = this.flock;
+    this.batUniforms.flockFlash.value = this.flash;
+    this.batUniforms.sparkle.value = this.sparkle;
+    u.flash.value = flicker;
+    u.mid.value = audio.mid;
+    u.sparkle.value = this.sparkle;
   }
 }

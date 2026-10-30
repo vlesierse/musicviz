@@ -13,6 +13,17 @@ const WAVES = 4;
 const HISTORY = 64;
 const ARC_C = new THREE.Vector3(0, 0, 14);
 const FOG_COLOR = new THREE.Color(0x0e0712);
+const MID_WAVES = 4;
+
+/** Lantern fire palettes [low columns, high columns]; cycle every 32 beats and on drops. */
+const FIRES: Array<[THREE.Color, THREE.Color]> = [
+  [new THREE.Color(1.0, 0.45, 0.08), new THREE.Color(1.0, 0.8, 0.3)],
+  [new THREE.Color(0.3, 1.0, 0.08), new THREE.Color(0.75, 1.0, 0.25)],
+  [new THREE.Color(0.55, 0.12, 1.0), new THREE.Color(1.0, 0.25, 0.75)],
+  [new THREE.Color(1.0, 0.4, 0.05), new THREE.Color(0.55, 0.15, 1.0)],
+  [new THREE.Color(0.04, 0.5, 1.0), new THREE.Color(0.2, 1.0, 0.6)],
+  [new THREE.Color(1.0, 0.06, 0.04), new THREE.Color(1.0, 0.45, 0.08)],
+];
 
 function rng(seed: number) {
   return () => {
@@ -196,6 +207,21 @@ export class PumpkinPatchVisual extends Visual {
   private camRight = new THREE.Vector3();
   private camUp = new THREE.Vector3();
   private drift = 0;
+  private tintAttr!: THREE.InstancedBufferAttribute;
+  private eCol = new Float32Array(EMBERS * 3);
+  private fire = 0;
+  private fireFrom = 0;
+  private fireMix = 1;
+  private fireSpeed = 0.4;
+  private beatsInFire = 0;
+  private lo = new THREE.Color();
+  private hi = new THREE.Color();
+  private tmpCol = new THREE.Color();
+  private midWaves = new Float32Array(MID_WAVES).fill(-100);
+  private midOrigin = new Float32Array(MID_WAVES);
+  private midCursor = 0;
+  private scream = new Float32Array(N);
+  private twinkle = 0;
 
   protected setup() {
     const rand = rng(9001);
@@ -203,7 +229,7 @@ export class PumpkinPatchVisual extends Visual {
 
     this.sky = fullscreenQuad(
       /* glsl */ `
-      uniform float time, aspect, flash;
+      uniform float time, aspect, flash, twinkle, seed;
       varying vec2 vUv;
       ${GLSL_NOISE}
       void main() {
@@ -214,11 +240,12 @@ export class PumpkinPatchVisual extends Visual {
         col += vec3(0.07, 0.025, 0.05) * smoothstep(0.1, 0.7, n) * smoothstep(-0.2, 0.25, p.y) * (1.0 - smoothstep(0.25, 0.5, p.y));
         vec2 sp = floor(vUv * vec2(aspect, 1.0) * 230.0);
         float h = hash21(sp);
-        col += step(0.9972, h) * smoothstep(0.05, 0.45, p.y) * (0.5 + 0.4 * sin(time * 2.5 + h * 60.0));
+        float glint = step(0.7, fract(h * 731.0 + seed * 0.618)) * twinkle;
+        col += step(0.9972, h) * smoothstep(0.05, 0.45, p.y) * (0.5 + 0.4 * sin(time * 2.5 + h * 60.0) + glint * 2.5);
         col += flash * vec3(0.25, 0.08, 0.02);
         gl_FragColor = vec4(col, 1.0);
       }`,
-      { time: { value: 0 }, aspect: { value: 1 }, flash: { value: 0 } },
+      { time: { value: 0 }, aspect: { value: 1 }, flash: { value: 0 }, twinkle: { value: 0 }, seed: { value: 0 } },
     );
     this.scene.add(this.sky);
 
@@ -281,27 +308,32 @@ export class PumpkinPatchVisual extends Visual {
     this.glowAttr = new THREE.InstancedBufferAttribute(glows, 1);
     this.faceAttr.setUsage(THREE.DynamicDrawUsage);
     this.glowAttr.setUsage(THREE.DynamicDrawUsage);
+    this.tintAttr = new THREE.InstancedBufferAttribute(new Float32Array(N * 3).fill(1), 3);
+    this.tintAttr.setUsage(THREE.DynamicDrawUsage);
     pg.setAttribute('aFace', this.faceAttr);
     pg.setAttribute('aGlow', this.glowAttr);
+    pg.setAttribute('aTint', this.tintAttr);
     const { map, emissiveMap } = faceAtlas();
     const mat = new THREE.MeshStandardMaterial({ map, emissiveMap, emissive: 0xffffff, roughness: 0.65 });
     mat.onBeforeCompile = (sh) => {
       sh.vertexShader = sh.vertexShader
-        .replace('#include <common>', '#include <common>\nattribute float aFace;\nattribute float aGlow;\nvarying float vGlow;')
+        .replace('#include <common>', '#include <common>\nattribute float aFace;\nattribute float aGlow;\nattribute vec3 aTint;\nvarying float vGlow;\nvarying vec3 vTint;')
         .replace(
           '#include <uv_vertex>',
           `#include <uv_vertex>
           vMapUv.y = (clamp(vMapUv.y, 0.02, 0.98) + aFace) * 0.25;
           vEmissiveMapUv.y = (clamp(vEmissiveMapUv.y, 0.02, 0.98) + aFace) * 0.25;
-          vGlow = aGlow;`,
+          vGlow = aGlow;
+          vTint = aTint;`,
         );
       sh.fragmentShader = sh.fragmentShader
-        .replace('#include <common>', '#include <common>\nvarying float vGlow;')
+        .replace('#include <common>', '#include <common>\nvarying float vGlow;\nvarying vec3 vTint;')
         .replace(
           '#include <emissivemap_fragment>',
           `#include <emissivemap_fragment>
-          totalEmissiveRadiance *= vGlow;
-          totalEmissiveRadiance += vec3(1.0, 0.32, 0.05) * 0.035 * vGlow;`,
+          float eLum = max(max(totalEmissiveRadiance.r, totalEmissiveRadiance.g), totalEmissiveRadiance.b);
+          totalEmissiveRadiance = vTint * eLum * vGlow;
+          totalEmissiveRadiance += mix(vec3(1.0, 0.32, 0.05), vTint, 0.5) * 0.035 * vGlow;`,
         );
     };
     this.pumpkins = new THREE.InstancedMesh(pg, mat, N);
@@ -340,6 +372,7 @@ export class PumpkinPatchVisual extends Visual {
     this.flameAttr.setUsage(THREE.DynamicDrawUsage);
     const fg = new THREE.PlaneGeometry(1, 1).translate(0, 0.5, 0);
     fg.setAttribute('aFlame', this.flameAttr);
+    fg.setAttribute('aTint', this.tintAttr);
     this.flames = new THREE.InstancedMesh(
       fg,
       new THREE.ShaderMaterial({
@@ -347,12 +380,15 @@ export class PumpkinPatchVisual extends Visual {
         vertexShader: /* glsl */ `
           uniform vec3 uRight, uUp;
           attribute float aFlame;
+          attribute vec3 aTint;
           varying vec2 vUv;
           varying float vAmt;
           varying float vSeed;
+          varying vec3 vTint;
           void main() {
             vUv = uv;
             vAmt = aFlame;
+            vTint = aTint;
             vec4 c = modelMatrix * instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0);
             vSeed = c.x * 1.7 + c.z * 3.1;
             float w = 0.55 + aFlame * 0.35;
@@ -365,6 +401,7 @@ export class PumpkinPatchVisual extends Visual {
           varying vec2 vUv;
           varying float vAmt;
           varying float vSeed;
+          varying vec3 vTint;
           ${GLSL_NOISE}
           void main() {
             if (vAmt < 0.01) discard;
@@ -374,7 +411,7 @@ export class PumpkinPatchVisual extends Visual {
             float x = abs(p.x - 0.5 + n * 0.08 * p.y);
             float body = smoothstep(width, width * 0.3, x);
             float core = smoothstep(width * 0.5, 0.0, x) * (1.0 - p.y);
-            vec3 col = mix(vec3(1.0, 0.18, 0.02), vec3(1.0, 0.75, 0.3), core) * (body * 1.2 + core * 1.6);
+            vec3 col = mix(vTint * vec3(1.0, 0.4, 0.4), vTint * 0.8 + 0.2, core) * (body * 1.2 + core * 1.6);
             gl_FragColor = vec4(col * 0.55 * min(vAmt * 1.5, 1.0), 1.0);
           }`,
         transparent: true,
@@ -497,7 +534,7 @@ export class PumpkinPatchVisual extends Visual {
     // Ground fog
     for (let i = 0; i < 3; i++) {
       const fmat = new THREE.ShaderMaterial({
-        uniforms: { time: { value: 0 }, density: { value: 0.4 }, seed: { value: i * 4.7 }, warm: { value: 0 } },
+        uniforms: { time: { value: 0 }, density: { value: 0.4 }, seed: { value: i * 4.7 }, warm: { value: 0 }, tint: { value: new THREE.Color(0.45, 0.2, 0.08) } },
         transparent: true,
         depthWrite: false,
         vertexShader: /* glsl */ `
@@ -509,6 +546,7 @@ export class PumpkinPatchVisual extends Visual {
           }`,
         fragmentShader: /* glsl */ `
           uniform float time, density, seed, warm;
+          uniform vec3 tint;
           varying vec3 vWorld;
           ${GLSL_NOISE}
           void main() {
@@ -516,7 +554,7 @@ export class PumpkinPatchVisual extends Visual {
             float a = smoothstep(-0.2, 0.8, n) * density;
             float dist = length(vWorld.xz - cameraPosition.xz);
             a *= smoothstep(2.0, 7.0, dist) * (1.0 - smoothstep(35.0, 70.0, dist));
-            vec3 col = mix(vec3(0.2, 0.13, 0.22), vec3(0.45, 0.2, 0.08), warm);
+            vec3 col = mix(vec3(0.2, 0.13, 0.22), tint, warm);
             gl_FragColor = vec4(col, a);
           }`,
       });
@@ -531,6 +569,7 @@ export class PumpkinPatchVisual extends Visual {
     const eg = new THREE.BufferGeometry();
     eg.setAttribute('position', new THREE.BufferAttribute(this.ePos, 3));
     eg.setAttribute('aLife', new THREE.BufferAttribute(this.eLife, 1));
+    eg.setAttribute('aCol', new THREE.BufferAttribute(this.eCol, 3));
     this.embers = new THREE.Points(
       eg,
       new THREE.ShaderMaterial({
@@ -538,9 +577,12 @@ export class PumpkinPatchVisual extends Visual {
         vertexShader: /* glsl */ `
           uniform float uScale;
           attribute float aLife;
+          attribute vec3 aCol;
           varying float vLife;
+          varying vec3 vCol;
           void main() {
             vLife = aLife;
+            vCol = aCol;
             vec4 mv = modelViewMatrix * vec4(position, 1.0);
             gl_PointSize = uScale * (0.04 + 0.05 * aLife) / -mv.z;
             gl_Position = projectionMatrix * mv;
@@ -548,10 +590,11 @@ export class PumpkinPatchVisual extends Visual {
         fragmentShader: /* glsl */ `
           uniform sampler2D map;
           varying float vLife;
+          varying vec3 vCol;
           void main() {
             if (vLife <= 0.0) discard;
             float a = texture2D(map, gl_PointCoord).a;
-            vec3 col = mix(vec3(0.9, 0.12, 0.02), vec3(1.3, 0.7, 0.25), vLife);
+            vec3 col = mix(vCol * vec3(0.9, 0.3, 0.3), vCol * 1.2 + 0.1, vLife);
             gl_FragColor = vec4(col * a * 0.45 * min(1.0, vLife * 2.0), 1.0);
           }`,
         transparent: true,
@@ -583,16 +626,19 @@ export class PumpkinPatchVisual extends Visual {
     this.embers.material.uniforms.uScale.value = h * 0.9;
   }
 
-  private emit(x: number, y: number, z: number, n: number, power: number) {
+  private emit(x: number, y: number, z: number, n: number, power: number, col: THREE.Color, spread = 1.2) {
     for (let k = 0; k < n; k++) {
       const i = this.eCursor;
       this.eCursor = (this.eCursor + 1) % EMBERS;
+      this.eCol[i * 3] = col.r;
+      this.eCol[i * 3 + 1] = col.g;
+      this.eCol[i * 3 + 2] = col.b;
       this.ePos[i * 3] = x + (Math.random() - 0.5) * 0.2;
       this.ePos[i * 3 + 1] = y;
       this.ePos[i * 3 + 2] = z + (Math.random() - 0.5) * 0.2;
-      this.eVel[i * 3] = (Math.random() - 0.5) * 1.2;
+      this.eVel[i * 3] = (Math.random() - 0.5) * spread;
       this.eVel[i * 3 + 1] = (1.5 + Math.random() * 2.5) * power;
-      this.eVel[i * 3 + 2] = (Math.random() - 0.5) * 1.2;
+      this.eVel[i * 3 + 2] = (Math.random() - 0.5) * spread;
       this.eLife[i] = 0.7 + Math.random() * 0.3;
     }
   }
@@ -615,6 +661,43 @@ export class PumpkinPatchVisual extends Visual {
       this.histHead = (this.histHead + 1) % HISTORY;
       this.history.set(this.colLevel, this.histHead * COLS);
     }
+    // Lantern fire palette: cycle every 32 beats or on a drop, crossfade, brightness pulls low toward high.
+    if (audio.beat) this.beatsInFire++;
+    if (audio.drop || this.beatsInFire >= 32) {
+      this.beatsInFire = 0;
+      this.fireFrom = this.fire;
+      this.fire = (this.fire + 1 + Math.floor(Math.random() * (FIRES.length - 1))) % FIRES.length;
+      this.fireMix = 0;
+      this.fireSpeed = audio.drop ? 2.5 : 0.35;
+    }
+    this.fireMix = Math.min(1, this.fireMix + dt * this.fireSpeed);
+    const fm = this.fireMix * this.fireMix * (3 - 2 * this.fireMix);
+    this.lo.copy(FIRES[this.fireFrom][0]).lerp(FIRES[this.fire][0], fm);
+    this.hi.copy(FIRES[this.fireFrom][1]).lerp(FIRES[this.fire][1], fm);
+    this.lo.lerp(this.hi, audio.brightness * 0.35);
+    const lo = this.lo;
+    const hi = this.hi;
+    const tmp = this.tmpCol;
+
+    // Snare: a lateral flicker wave from a random column
+    if (audio.midHit) {
+      this.midWaves[this.midCursor] = time;
+      this.midOrigin[this.midCursor] = Math.floor(Math.random() * COLS);
+      this.midCursor = (this.midCursor + 1) % MID_WAVES;
+    }
+    // Hats: a few pumpkins spit a quick burst of sparks, stars glint
+    if (audio.trebleHit) {
+      this.twinkle = 1;
+      this.sky.material.uniforms.seed.value = audio.trebleHitCount;
+      const n = 2 + Math.floor(audio.treble * 3);
+      for (let k = 0; k < n; k++) {
+        const i = Math.floor(Math.random() * N);
+        this.scream[i] = 1;
+        this.emit(this.base[i * 4], this.base[i * 4 + 1] + 0.6 * this.scaleBase[i], this.base[i * 4 + 2], 6, 2.2, hi, 3);
+      }
+    }
+    this.twinkle *= Math.exp(-dt * 5);
+
     if (audio.beat) {
       this.waves[this.waveCursor] = time;
       this.waveAmp[this.waveCursor] = 0.6 + audio.bass * 1.2;
@@ -628,6 +711,8 @@ export class PumpkinPatchVisual extends Visual {
     const faces = this.faceAttr.array as Float32Array;
     const glows = this.glowAttr.array as Float32Array;
     const flames = this.flameAttr.array as Float32Array;
+    const tints = this.tintAttr.array as Float32Array;
+    const screamDecay = Math.exp(-dt * 6);
     const d = this.dummy;
     for (let r = 0; r < ROWS; r++) {
       const lag = r * 3;
@@ -644,25 +729,43 @@ export class PumpkinPatchVisual extends Visual {
           const x = Math.abs(c - 7.5) + r * 0.8 - age * 22;
           wave += Math.exp(-x * x * 0.35) * this.waveAmp[w];
         }
-        const hop = v * 0.8 + wave * 0.15 + jump * (0.85 + 0.3 * Math.sin(i * 1.7));
+        let mw = 0;
+        for (let w = 0; w < MID_WAVES; w++) {
+          const age = time - this.midWaves[w];
+          if (age < 0 || age > 1.2) continue;
+          const x = Math.abs(c - this.midOrigin[w]) + r * 0.6 - age * 16;
+          mw += Math.exp(-x * x * 0.6) * Math.exp(-age * 1.8);
+        }
+        mw = Math.min(1, mw);
+        this.scream[i] *= screamDecay;
+        const hop = v * 0.8 + wave * 0.15 + mw * 0.22 + jump * (0.85 + 0.3 * Math.sin(i * 1.7));
         const sq = 1 + v * 0.22 - wave * 0.05;
         const s = this.scaleBase[i];
         d.position.set(this.base[i * 4], this.base[i * 4 + 1] + hop, this.base[i * 4 + 2]);
-        d.rotation.set(Math.sin(time * 1.3 + i) * 0.04 * v, this.base[i * 4 + 3] + (jump > 0 ? Math.sin(sinceDrop * 7 + i) * 0.4 : 0), Math.sin(time * 2.1 + i * 0.7) * 0.06 * v);
+        d.rotation.set(Math.sin(time * 1.3 + i) * 0.04 * v, this.base[i * 4 + 3] + (jump > 0 ? Math.sin(sinceDrop * 7 + i) * 0.4 : 0) + mw * 0.35 * Math.sin(i * 3.1), Math.sin(time * 2.1 + i * 0.7) * 0.06 * v + mw * 0.12 * Math.sin(time * 40 + i));
         d.scale.set(s / Math.sqrt(sq), s * sq, s / Math.sqrt(sq));
         d.updateMatrix();
         this.pumpkins.setMatrixAt(i, d.matrix);
         this.stems.setMatrixAt(i, d.matrix);
         this.flames.setMatrixAt(i, d.matrix);
-        glows[i] = Math.min(1.25, 0.24 + v * 1.35 + wave * 0.55 + dropEnv * 0.2) * candle * (1 - r * 0.12);
+        glows[i] = Math.min(1.6, 0.24 + v * 1.35 + wave * 0.55 + mw * 0.6 + this.scream[i] * 0.7 + dropEnv * 0.2) * candle * (1 - r * 0.12);
+        // Low columns burn the main colour, high columns the accent; snare wave flashes toward white-hot accent.
+        tmp.copy(lo).lerp(hi, c / (COLS - 1));
+        tmp.lerp(hi, Math.min(1, mw * 0.8 + this.scream[i]));
+        // Normalise perceived brightness so green/cyan fires don't blow out the bloom.
+        const lk = Math.min(1.4, 0.55 / (0.3 * tmp.r + 0.59 * tmp.g + 0.11 * tmp.b + 1e-3));
+        const wb = mw * 0.2;
+        tints[i * 3] = tmp.r * lk + wb;
+        tints[i * 3 + 1] = tmp.g * lk + wb;
+        tints[i * 3 + 2] = tmp.b * lk + wb;
         faces[i] = sinceDrop < 1.6 ? 3 : Math.min(3, Math.floor(v * 3.6 + this.bias[i]));
         const f = Math.max(flameDrop * (0.7 + 0.3 * Math.sin(i * 2.3)), v > 0.82 ? (v - 0.82) * 3 : 0);
         flames[i] = f;
-        if (f > 0.15 && Math.random() < f * 0.18) this.emit(d.position.x, d.position.y + 0.6 * s, d.position.z, 1, 0.8 + f);
+        if (f > 0.15 && Math.random() < f * 0.18) this.emit(d.position.x, d.position.y + 0.6 * s, d.position.z, 1, 0.8 + f, tmp);
       }
     }
     if (audio.drop) {
-      for (let i = 0; i < N; i++) this.emit(this.base[i * 4], this.base[i * 4 + 1] + 0.6, this.base[i * 4 + 2], 5, 1.6);
+      for (let i = 0; i < N; i++) this.emit(this.base[i * 4], this.base[i * 4 + 1] + 0.6, this.base[i * 4 + 2], 5, 1.6, i % 2 ? lo : hi);
     }
     this.pumpkins.instanceMatrix.needsUpdate = true;
     this.stems.instanceMatrix.needsUpdate = true;
@@ -670,6 +773,7 @@ export class PumpkinPatchVisual extends Visual {
     this.faceAttr.needsUpdate = true;
     this.glowAttr.needsUpdate = true;
     this.flameAttr.needsUpdate = true;
+    this.tintAttr.needsUpdate = true;
 
     // Embers
     for (let i = 0; i < EMBERS; i++) {
@@ -685,23 +789,30 @@ export class PumpkinPatchVisual extends Visual {
     }
     this.embers.geometry.attributes.position.needsUpdate = true;
     (this.embers.geometry.attributes.aLife as THREE.BufferAttribute).needsUpdate = true;
+    (this.embers.geometry.attributes.aCol as THREE.BufferAttribute).needsUpdate = true;
 
     // Lights follow low / mid / high thirds of the patch
     for (let k = 0; k < 3; k++) {
       let s = 0;
       for (let c = k * 5; c < k * 5 + 6; c++) s += this.level[c];
-      this.lights[k].intensity = (4 + (s / 6) * 22 + audio.beatPulse * 4 + dropEnv * 5) * candle;
+      this.lights[k].intensity = (4 + (s / 6) * 22 + audio.beatPulse * 4 + audio.midPulse * 5 + dropEnv * 5) * candle;
+      this.lights[k].color.copy(lo).lerp(hi, k * 0.5);
     }
     this.hemi.intensity = 0.4 + dropEnv * 0.15;
-    this.scarecrowEyes.color.setRGB(1.2 + audio.mid * 2 + dropEnv * 3, 0.4 * (1 - dropEnv) + audio.mid * 0.4, 0.06);
+    const eyeK = 1.2 + audio.mid * 2 + audio.midPulse * 3 + dropEnv * 3;
+    tmp.copy(hi).lerp(FIRES[5][0], dropEnv);
+    this.scarecrowEyes.color.setRGB(tmp.r * eyeK, tmp.g * eyeK, tmp.b * eyeK);
 
     this.sky.material.uniforms.time.value = time;
     this.sky.material.uniforms.flash.value = dropEnv * 0.2;
+    this.sky.material.uniforms.twinkle.value = Math.max(this.twinkle, audio.treble * 0.25);
     this.moon.material.uniforms.glow.value = audio.bass + audio.beatPulse * 0.4;
     for (const f of this.fogLayers) {
       f.material.uniforms.time.value = time;
       f.material.uniforms.density.value = 0.16 + audio.bass * 0.2;
-      f.material.uniforms.warm.value = Math.min(1, audio.level * 0.8 + dropEnv * 0.5);
+      f.material.uniforms.warm.value = Math.min(1, audio.level * 0.8 + dropEnv * 0.5 + audio.midPulse * 0.25);
+      const fk = 0.24 / (0.3 * lo.r + 0.59 * lo.g + 0.11 * lo.b + 1e-3);
+      f.material.uniforms.tint.value.setRGB(lo.r * fk, lo.g * fk, lo.b * fk);
     }
 
     // Slow drifting camera

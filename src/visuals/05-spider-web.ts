@@ -7,6 +7,16 @@ import { SpectrumTexture, Visual, damp, fullscreenQuad } from '../core/Visual';
 const HUB = new THREE.Vector2(0, 0.04);
 const HANG_Y = -0.26;
 
+const C = (hex: number) => new THREE.Color(hex);
+/** Web colour schemes [low spokes, high spokes, kick ripple, snare pluck, dew, mist]; cycled every 32 beats and on drops. */
+const SCHEMES: THREE.Color[][] = [
+  [PALETTE.pumpkin.clone(), C(0xffd040), PALETTE.toxic.clone(), C(0xff2fb0), C(0xd8f0ff), C(0x5a2a90)],
+  [C(0xff2fb0), C(0x9b30ff), C(0x30d8ff), C(0xffd040), C(0xffd0f0), C(0x7a1a70)],
+  [C(0xd0001c), C(0xff7a10), C(0xffb347), C(0x9b30ff), C(0xffe0c0), C(0x701020)],
+  [C(0x00e0c0), C(0x3a5cff), PALETTE.toxic.clone(), C(0xff7a10), C(0xc0fff0), C(0x104a60)],
+  [PALETTE.toxic.clone(), C(0xd0ff40), C(0x9b30ff), C(0x30d8ff), C(0xe0ffd0), C(0x1a5020)],
+];
+
 function spiderTexture() {
   const s = 128;
   const c = document.createElement('canvas');
@@ -70,18 +80,29 @@ export class SpiderWebVisual extends Visual {
   readonly name = 'Spider-Web Spectrum';
   private quad!: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>;
   private spectrum = new SpectrumTexture(64);
-  private rippleT = 10;
+  private kickAges = new THREE.Vector2(10, 10);
+  private plucks = [new THREE.Vector3(0, 0, 10), new THREE.Vector3(0, 0, 10)];
+  private pluckIdx = 0;
+  private cols = [new THREE.Color(), new THREE.Color(), new THREE.Color(), new THREE.Color(), new THREE.Color(), new THREE.Color()];
+  private scheme = 0;
+  private schemeFrom = 0;
+  private schemeMix = 1;
+  private schemeSpeed = 0.35;
+  private beatsInScheme = 0;
   private spiderY = HUB.y;
   private spiderV = 0;
   private hangUntil = -1;
   private lastDescent = -100;
 
   protected setup() {
+    this.updateScheme(0, null);
     this.quad = fullscreenQuad(
       /* glsl */ `
       uniform sampler2D spectrum, spiderTex;
-      uniform float time, aspect, px, bass, treble, beatPulse, dropPulse, ripple, rot;
-      uniform vec2 spiderPos;
+      uniform float time, aspect, px, bass, treble, beatPulse, dropPulse, rot, brightness, dewFlash, dewSeed, mid;
+      uniform vec2 spiderPos, kickAges;
+      uniform vec3 pluck0, pluck1;
+      uniform vec3 colLow, colHigh, colRipple, colPluck, colDew, colMist;
       uniform float spiderSize, spiderRot;
       varying vec2 vUv;
       #define PI 3.14159265
@@ -89,9 +110,14 @@ export class SpiderWebVisual extends Visual {
       #define RINGS 15
       ${GLSL_NOISE}
 
+      float bandT(float i) { return abs(mod(i, SPOKES) / (SPOKES * 0.5) - 1.0); }
       float band(float i) {
-        float t = abs(mod(i, SPOKES) / (SPOKES * 0.5) - 1.0);
-        return texture2D(spectrum, vec2(mix(0.03, 0.9, t), 0.5)).r;
+        return texture2D(spectrum, vec2(mix(0.03, 0.9, bandT(i)), 0.5)).r;
+      }
+      float pluckRing(vec3 pl, vec2 q) {
+        float R = 0.01 + pl.z * 0.45;
+        float d = length(q - pl.xy);
+        return exp(-pow((d - R) / (0.012 + pl.z * 0.03), 2.0)) * exp(-pl.z * 2.2) + exp(-d * 30.0) * exp(-pl.z * 5.0);
       }
       float sdSeg(vec2 p, vec2 a, vec2 b) {
         vec2 pa = p - a, ba = b - a;
@@ -108,7 +134,7 @@ export class SpiderWebVisual extends Visual {
         // Night sky, mist and a pale moon behind the web.
         vec3 col = mix(vec3(0.03, 0.012, 0.05), vec3(0.006, 0.003, 0.012), vUv.y);
         float mist = fbm(vec3(p * 2.0 + vec2(time * 0.02, 0.0), time * 0.04));
-        col += vec3(0.05, 0.03, 0.08) * smoothstep(-0.2, 0.8, mist);
+        col += colMist * 0.1 * (0.8 + mid * 0.6) * smoothstep(-0.2, 0.8, mist);
         vec2 mc = vec2(0.5 * aspect / 1.78, 0.24);
         float mr = length(p - mc);
         float craters = fbm(vec3((p - mc) * 9.0, 2.0)) * 0.5 + 0.5;
@@ -137,9 +163,9 @@ export class SpiderWebVisual extends Visual {
           float b = k == 0 ? b0 : b1;
           float along = dot(q, d);
           float perp = abs(d.x * q.y - d.y * q.x + b * 0.005 * sin(along * 45.0 - time * 30.0));
-          float s = thread(perp, w) * step(0.0, along) * (0.22 + b * 1.5) * (1.0 - smoothstep(0.8, 1.3, along));
+          float s = thread(perp, w) * step(0.0, along) * (0.2 + b * 0.9) * (1.0 - smoothstep(0.8, 1.3, along));
           web += s;
-          tint += s * b * ${glslColor(PALETTE.pumpkin)};
+          tint += s * b * mix(colLow, colHigh, bandT(k == 0 ? i0 : i1));
         }
 
         // sagging ring chords + dew drops at the joints
@@ -159,16 +185,19 @@ export class SpiderWebVisual extends Visual {
           vec2 Q3 = mix(mix(P0, C, 0.75), mix(C, P1, 0.75), 0.75);
           float torn = step(0.06, hash21(vec2(mod(i0, SPOKES), fj)));
           float d = min(min(sdSeg(q, P0, Q1), sdSeg(q, Q1, Q2)), min(sdSeg(q, Q2, Q3), sdSeg(q, Q3, P1)));
-          float rip = exp(-abs(rj - ripple * 0.7) * 25.0) * exp(-ripple * 1.5);
-          float s = thread(d, w) * (0.16 + bj * 0.9 + rip * 2.0) * torn;
+          float rip = exp(-abs(rj - kickAges.x * 0.7) * 25.0) * exp(-kickAges.x * 1.5)
+                    + exp(-abs(rj - kickAges.y * 0.7) * 25.0) * exp(-kickAges.y * 1.5);
+          float s = thread(d, w) * (0.14 + bj * 0.55 + rip * 2.0) * torn;
           web += s;
-          tint += s * rip * ${glslColor(PALETTE.toxic)} * 2.0;
+          tint += s * (rip * colRipple * 2.0 + bj * 0.5 * mix(colLow, colHigh, bandT(i0 + 0.5)));
           for (int k = 0; k < 2; k++) {
             vec2 P = k == 0 ? P0 : P1;
             float h = hash21(vec2(mod(k == 0 ? i0 : i1, SPOKES), fj + 31.0));
             if (h > 0.6) {
               float tw = 0.5 + 0.5 * sin(time * (4.0 + h * 6.0) + h * 60.0);
-              dew += exp(-pow(length(q - P) / (px * 2.6), 2.0)) * (0.5 + tw * (0.6 + treble * 2.0));
+              // a different handful of dew drops flashes on every hi-hat
+              float fl = dewFlash * step(0.55, fract(h * 97.0 + dewSeed * 0.618));
+              dew += exp(-pow(length(q - P) / (px * (2.6 + fl * 1.5)), 2.0)) * (0.5 + tw * (0.6 + treble * 2.0) + fl * 3.0);
             }
           }
         }
@@ -176,8 +205,11 @@ export class SpiderWebVisual extends Visual {
         web += thread(abs(r - 0.03), w) * 1.2 + thread(abs(r - 0.05), w) * 1.0;
 
         web *= 0.35 + 0.65 * smoothstep(0.0, 0.2, r);
-        vec3 silver = vec3(0.72, 0.74, 0.88);
-        col += silver * web + tint * 0.8 + vec3(0.85, 0.95, 1.0) * dew * 1.3;
+        // thread colour temperature follows the music's brightness
+        vec3 silver = mix(vec3(0.72, 0.74, 0.88), mix(colLow, colHigh, brightness) * 0.85, 0.22);
+        float pl = pluckRing(pluck0, q) + pluckRing(pluck1, q);
+        col += silver * web * 0.45 + tint * 1.0 + colDew * dew * 0.95;
+        col += colPluck * web * pl * 2.2;
         col += ${glslColor(PALETTE.slime)} * web * dropPulse * 0.8;
 
         // spider + its silk thread
@@ -208,7 +240,19 @@ export class SpiderWebVisual extends Visual {
         treble: { value: 0 },
         beatPulse: { value: 0 },
         dropPulse: { value: 0 },
-        ripple: { value: 10 },
+        kickAges: { value: this.kickAges },
+        pluck0: { value: this.plucks[0] },
+        pluck1: { value: this.plucks[1] },
+        brightness: { value: 0.5 },
+        mid: { value: 0 },
+        dewFlash: { value: 0 },
+        dewSeed: { value: 0 },
+        colLow: { value: this.cols[0] },
+        colHigh: { value: this.cols[1] },
+        colRipple: { value: this.cols[2] },
+        colPluck: { value: this.cols[3] },
+        colDew: { value: this.cols[4] },
+        colMist: { value: this.cols[5] },
         rot: { value: 0 },
         spiderPos: { value: new THREE.Vector2(HUB.x, HUB.y) },
         spiderSize: { value: 0.15 },
@@ -225,10 +269,37 @@ export class SpiderWebVisual extends Visual {
     this.quad.material.uniforms.px.value = 1 / h;
   }
 
+  private updateScheme(dt: number, audio: AudioFeatures | null) {
+    if (audio) {
+      if (audio.beat) this.beatsInScheme++;
+      if (audio.drop || this.beatsInScheme >= 32) {
+        this.schemeFrom = this.scheme;
+        this.scheme = (this.scheme + 1 + (audio.drop ? Math.floor(Math.random() * 2) : 0)) % SCHEMES.length;
+        this.schemeMix = 0;
+        this.schemeSpeed = audio.drop ? 2.5 : 0.35;
+        this.beatsInScheme = 0;
+      }
+    }
+    this.schemeMix = Math.min(1, this.schemeMix + dt * this.schemeSpeed);
+    const m = this.schemeMix * this.schemeMix * (3 - 2 * this.schemeMix);
+    for (let k = 0; k < 6; k++) this.cols[k].copy(SCHEMES[this.schemeFrom][k]).lerp(SCHEMES[this.scheme][k], m);
+  }
+
   update(dt: number, time: number, audio: AudioFeatures) {
+    this.updateScheme(dt, audio);
     this.spectrum.update(audio.bands);
-    if (audio.beat) this.rippleT = 0;
-    this.rippleT += dt;
+    // kicks send rings out from the hub; they overlap instead of restarting
+    if (audio.beat) this.kickAges.set(0, this.kickAges.x);
+    this.kickAges.addScalar(dt);
+    // snares/claps pluck the web at a random spot, as if something got caught
+    if (audio.midHit) {
+      const p = this.plucks[this.pluckIdx];
+      this.pluckIdx = 1 - this.pluckIdx;
+      const a = Math.random() * Math.PI * 2;
+      const r = 0.1 + Math.random() * 0.3;
+      p.set(Math.cos(a) * r, Math.sin(a) * r, 0);
+    }
+    for (const p of this.plucks) p.z += dt;
 
     // The spider drops down on its thread on a drop (or every so often), then climbs back.
     if (audio.drop || (audio.beat && audio.beatCount % 64 === 32 && time - this.lastDescent > 20)) {
@@ -246,13 +317,19 @@ export class SpiderWebVisual extends Visual {
     const u = this.quad.material.uniforms;
     const away = Math.min(1, (HUB.y - this.spiderY) / 0.1);
     u.spiderPos.value.set(Math.sin(time * 1.3) * 0.012 * away, this.spiderY);
-    u.spiderRot.value = Math.sin(time * 1.3) * 0.12 * away + Math.sin(time * 9) * audio.beatPulse * 0.05;
+    u.spiderRot.value = Math.sin(time * 1.3) * 0.12 * away + Math.sin(time * 9) * audio.beatPulse * 0.05 + Math.sin(time * 37) * audio.midPulse * 0.08;
     u.time.value = time;
     u.bass.value = audio.bass;
     u.treble.value = audio.treble;
     u.beatPulse.value = audio.beatPulse;
     u.dropPulse.value = audio.dropPulse;
-    u.ripple.value = this.rippleT;
+    u.brightness.value = audio.brightness;
+    u.mid.value = damp(u.mid.value, audio.mid, 4, dt);
+    if (audio.trebleHit) {
+      u.dewFlash.value = 1;
+      u.dewSeed.value = audio.trebleHitCount % 1000;
+    }
+    u.dewFlash.value = damp(u.dewFlash.value, 0, 6, dt);
     u.rot.value = damp(u.rot.value, Math.sin(time * 0.15) * 0.06, 2, dt);
   }
 }

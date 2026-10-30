@@ -9,6 +9,17 @@ const FRAMES = 3;
 const FLYERS = 8;
 const FLOCK = 14;
 const WITCHES = FLYERS + FLOCK;
+const RING = 40;
+
+/** Spell palettes (three trail colours each); cycle every 32 beats and on drops. */
+const SPELLS: Array<[THREE.Color, THREE.Color, THREE.Color]> = [
+  [new THREE.Color(0.25, 1.0, 0.18), new THREE.Color(0.75, 0.22, 1.0), new THREE.Color(1.0, 0.45, 0.08)],
+  [new THREE.Color(0.15, 0.85, 1.0), new THREE.Color(1.0, 0.2, 0.7), new THREE.Color(0.6, 0.3, 1.0)],
+  [new THREE.Color(1.0, 0.55, 0.05), new THREE.Color(1.0, 0.12, 0.08), new THREE.Color(1.0, 0.9, 0.35)],
+  [new THREE.Color(0.55, 1.0, 0.1), new THREE.Color(0.1, 1.0, 0.6), new THREE.Color(0.85, 1.0, 0.4)],
+  [new THREE.Color(0.95, 0.2, 1.0), new THREE.Color(0.3, 0.35, 1.0), new THREE.Color(1.0, 0.5, 0.85)],
+  [new THREE.Color(1.0, 0.3, 0.05), new THREE.Color(0.2, 0.9, 1.0), new THREE.Color(0.7, 0.2, 1.0)],
+];
 const SPARKS = 4500;
 const MOON = { x: 0.2, y: 0.12, r: 0.27 };
 // broom tail in sprite-local units (sprite height = 1, width = 2)
@@ -406,7 +417,8 @@ function villageTexture() {
 }
 
 const SKY_FRAG = /* glsl */ `
-uniform float time, aspect, bass, treble, glow, drop;
+uniform float time, aspect, bass, treble, glow, drop, glint, seed, flash, bright;
+uniform vec3 horizon, accent;
 varying vec2 vUv;
 ${GLSL_NOISE}
 float fbm4(vec3 p) { float f = 0.0, a = 0.5; for (int i = 0; i < 4; i++) { f += a * snoise(p); p *= 2.03; a *= 0.5; } return f; }
@@ -414,7 +426,8 @@ void main() {
   vec2 p = (vUv - 0.5) * vec2(aspect, 1.0);
   // purple night fading to a smouldering orange horizon
   vec3 col = mix(vec3(0.075, 0.02, 0.1), vec3(0.012, 0.005, 0.03), smoothstep(-0.25, 0.5, p.y));
-  col = mix(col, vec3(0.32, 0.09, 0.03), smoothstep(-0.05, -0.45, p.y));
+  col = mix(col, horizon, smoothstep(-0.05, -0.45, p.y));
+  col += accent * flash * 0.07 * smoothstep(0.5, -0.4, p.y);
   // stars
   vec2 g = p * 70.0;
   vec2 cell = floor(g);
@@ -424,7 +437,9 @@ void main() {
     float d = length(g - sp);
     float tw = 0.55 + 0.45 * sin(time * (2.0 + h * 6.0) + h * 60.0);
     tw = mix(tw, tw * tw * 1.8, treble);
-    col += vec3(0.85, 0.85, 1.0) * exp(-d * d * 22.0) * tw * (0.25 + 0.6 * fract(h * 37.0)) * smoothstep(-0.2, 0.15, p.y);
+    float gl = step(0.72, fract(h * 513.0 + seed * 0.618)) * glint;
+    vec3 sc = mix(vec3(0.85, 0.85, 1.0), accent + 0.3, gl * 0.6);
+    col += sc * (exp(-d * d * 22.0) * (tw + gl * 2.2) + gl * 0.25 * exp(-d * d * 3.0)) * (0.25 + 0.6 * fract(h * 37.0)) * smoothstep(-0.2, 0.15, p.y);
   }
   // huge full moon
   vec2 mc = vec2(${MOON.x.toFixed(2)}, ${MOON.y.toFixed(2)});
@@ -432,6 +447,7 @@ void main() {
   vec2 mq = p - mc;
   float md = length(mq);
   vec3 moonC = mix(vec3(1.0, 0.78, 0.45), vec3(1.0, 0.55, 0.2), drop * 0.5);
+  moonC = mix(moonC, normalize(accent + 0.6) * 1.2, bright * 0.35);
   col += moonC * (0.05 + 0.1 * glow) * exp(-max(md - R, 0.0) * 4.0);
   col += moonC * 0.06 * glow * exp(-max(md - R, 0.0) * 16.0);
   if (md < R + 0.01) {
@@ -450,7 +466,7 @@ void main() {
     float n = fbm4(vec3(cp, time * 0.01 + fi));
     float band = smoothstep(0.12, -0.05, abs(p.y - (0.2 - fi * 0.38)) - 0.06);
     float c = smoothstep(0.0, 0.45, n + 0.25 * band - 0.15) * (0.55 + 0.45 * band);
-    vec3 cc = mix(vec3(0.03, 0.01, 0.05), vec3(0.11, 0.035, 0.05), smoothstep(0.1, -0.4, p.y));
+    vec3 cc = mix(vec3(0.03, 0.01, 0.05), mix(vec3(0.11, 0.035, 0.05), horizon * 0.4, 0.5), smoothstep(0.1, -0.4, p.y));
     cc += moonC * 0.45 * exp(-md * 3.5) * smoothstep(0.15, 0.6, n);
     col = mix(col, cc, c * 0.85);
   }
@@ -499,18 +515,47 @@ export class WitchFlightVisual extends Visual {
   private glow = 0;
   private swoopT = -1;
   private swoopDir = 1;
+  private spell = [new THREE.Color(), new THREE.Color(), new THREE.Color()];
+  private spellIdx = 0;
+  private spellFrom = 0;
+  private spellMix = 1;
+  private spellSpeed = 0.35;
+  private beatsInSpell = 0;
+  private glintEnv = 0;
+  private flashEnv = 0;
+  private winU = { value: 0 };
+  private winSeed = { value: 0 };
 
   protected setup() {
     this.camera = new THREE.OrthographicCamera(-0.5, 0.5, 0.5, -0.5, -1, 1);
-    this.skyU = { time: { value: 0 }, aspect: { value: 1 }, bass: { value: 0 }, treble: { value: 0 }, glow: { value: 0 }, drop: { value: 0 } };
+    this.skyU = {
+      time: { value: 0 }, aspect: { value: 1 }, bass: { value: 0 }, treble: { value: 0 }, glow: { value: 0 }, drop: { value: 0 },
+      glint: { value: 0 }, seed: { value: 0 }, flash: { value: 0 }, bright: { value: 0 },
+      horizon: { value: new THREE.Color(0.32, 0.09, 0.03) }, accent: { value: new THREE.Color(1, 0.45, 0.08) },
+    };
     this.quad = fullscreenQuad(SKY_FRAG, this.skyU);
     this.scene.add(this.quad);
 
     // witches behind the village (far flyers) use the same mesh; the village is drawn in between via renderOrder
-    this.village = new THREE.Mesh(
-      new THREE.PlaneGeometry(1, 1),
-      new THREE.MeshBasicMaterial({ map: villageTexture(), transparent: true, depthTest: false, depthWrite: false }),
-    );
+    const vMat = new THREE.MeshBasicMaterial({ map: villageTexture(), transparent: true, depthTest: false, depthWrite: false });
+    // Lit windows (bright, warm texels) flare on snares; the seed picks which windows flare hardest.
+    vMat.onBeforeCompile = (sh) => {
+      sh.uniforms.uWin = this.winU;
+      sh.uniforms.uWinSeed = this.winSeed;
+      sh.fragmentShader = sh.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform float uWin, uWinSeed;')
+        .replace(
+          '#include <map_fragment>',
+          `#include <map_fragment>
+          {
+            float warmT = smoothstep(0.25, 0.8, diffuseColor.r - diffuseColor.b);
+            vec2 cell = floor(vMapUv * vec2(90.0, 22.0));
+            float hv = fract(sin(dot(cell, vec2(12.9898, 78.233)) + uWinSeed * 1.618) * 43758.5453);
+            diffuseColor.rgb *= 1.0 + warmT * uWin * (0.3 + 1.4 * hv);
+          }`,
+        );
+    };
+    this.village = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), vMat);
     this.village.renderOrder = 1;
     this.scene.add(this.village);
 
@@ -522,7 +567,7 @@ export class WitchFlightVisual extends Visual {
     sg.setAttribute('position', this.sPosAttr);
     sg.setAttribute('aCol', this.sColAttr);
     sg.setAttribute('aSize', this.sSizeAttr);
-    this.sparkU = { scale: { value: 720 }, time: { value: 0 }, treble: { value: 0 } };
+    this.sparkU = { scale: { value: 720 }, time: { value: 0 }, treble: { value: 0 }, glint: { value: 0 }, seed: { value: 0 } };
     const sparks = new THREE.Points(
       sg,
       new THREE.ShaderMaterial({
@@ -539,7 +584,7 @@ export class WitchFlightVisual extends Visual {
             if (aCol.a <= 0.0) gl_PointSize = 0.0;
           }`,
         fragmentShader: /* glsl */ `
-          uniform float time, treble;
+          uniform float time, treble, glint, seed;
           varying vec4 vCol;
           void main() {
             vec2 q = gl_PointCoord * 2.0 - 1.0;
@@ -548,8 +593,9 @@ export class WitchFlightVisual extends Visual {
             float core = exp(-r2 * 30.0);
             float halo = exp(-r2 * 6.0) * 0.25;
             float tw = 0.5 + 0.5 * sin(time * 17.0 + vCol.a * 400.0);
-            float cross = (exp(-abs(q.x) * 28.0) * exp(-abs(q.y) * 2.5) + exp(-abs(q.y) * 28.0) * exp(-abs(q.x) * 2.5)) * (0.35 + 0.9 * treble * tw);
-            float i = core + halo + cross * 0.6;
+            float gl = step(0.8, fract(vCol.a * 13.7 + seed * 0.618)) * glint;
+            float cross = (exp(-abs(q.x) * 28.0) * exp(-abs(q.y) * 2.5) + exp(-abs(q.y) * 28.0) * exp(-abs(q.x) * 2.5)) * (0.35 + 0.9 * treble * tw + gl * 2.5);
+            float i = core * (1.0 + gl * 1.5) + halo + cross * 0.6;
             gl_FragColor = vec4(vCol.rgb * i * (0.75 + 0.5 * tw * treble), 1.0);
           }`,
         transparent: true,
@@ -646,7 +692,7 @@ export class WitchFlightVisual extends Visual {
     this.fphase[i] = Math.random() * 100;
   }
 
-  private emit(x: number, y: number, vx: number, vy: number, size: number, life: number) {
+  private emit(x: number, y: number, vx: number, vy: number, size: number, life: number, c: THREE.Color, k = 0.42) {
     const i = this.sHead;
     this.sHead = (this.sHead + 1) % SPARKS;
     this.sPos[i * 3] = x;
@@ -656,12 +702,9 @@ export class WitchFlightVisual extends Visual {
     this.sLife[i] = life;
     this.sMax[i] = life;
     this.sSize[i] = size;
-    const r = Math.random();
-    const c = r < 0.4 ? [0.25, 1.0, 0.18] : r < 0.75 ? [0.75, 0.22, 1.0] : [1.0, 0.45, 0.08];
-    const k = 0.38;
-    this.sBase[i * 3] = c[0] * k;
-    this.sBase[i * 3 + 1] = c[1] * k;
-    this.sBase[i * 3 + 2] = c[2] * k;
+    this.sBase[i * 3] = c.r * k;
+    this.sBase[i * 3 + 1] = c.g * k;
+    this.sBase[i * 3 + 2] = c.b * k;
   }
 
   onEnter() {
@@ -678,6 +721,27 @@ export class WitchFlightVisual extends Visual {
       this.swoopDir = Math.random() < 0.5 ? 1 : -1;
     }
 
+    // Spell palette: cycle every 32 beats or on a drop with a smooth crossfade
+    if (audio.beat) this.beatsInSpell++;
+    if (audio.drop || this.beatsInSpell >= 32) {
+      this.beatsInSpell = 0;
+      this.spellFrom = this.spellIdx;
+      this.spellIdx = (this.spellIdx + 1 + Math.floor(Math.random() * (SPELLS.length - 1))) % SPELLS.length;
+      this.spellMix = 0;
+      this.spellSpeed = audio.drop ? 2.5 : 0.35;
+    }
+    this.spellMix = Math.min(1, this.spellMix + dt * this.spellSpeed);
+    const sm = this.spellMix * this.spellMix * (3 - 2 * this.spellMix);
+    for (let k = 0; k < 3; k++) this.spell[k].copy(SPELLS[this.spellFrom][k]).lerp(SPELLS[this.spellIdx][k], sm);
+    const accent = this.spell[2];
+
+    if (audio.trebleHit) {
+      this.glintEnv = 1;
+      this.skyU.seed.value = audio.trebleHitCount;
+      this.sparkU.seed.value = audio.trebleHitCount;
+    }
+    this.glintEnv *= Math.exp(-dt * 5);
+
     // regular flyers
     for (let i = 0; i < FLYERS; i++) {
       const size = this.fsize[i];
@@ -686,7 +750,8 @@ export class WitchFlightVisual extends Visual {
       this.fphase[i] += dt * (0.6 + this.speed * 0.5);
       const ph = this.fphase[i];
       const vx = dir * v;
-      const ny = this.fbaseY[i] + Math.sin(ph * 0.9) * 0.04 + Math.sin(ph * 0.37) * 0.05;
+      const band = audio.bands[4 + i * 6];
+      const ny = this.fbaseY[i] + Math.sin(ph * 0.9) * (0.04 + band * 0.03) + Math.sin(ph * 0.37) * 0.05;
       const vy = (ny - this.fy[i]) / Math.max(dt, 1e-3);
       this.fx[i] += vx * dt;
       this.fy[i] = ny;
@@ -730,7 +795,9 @@ export class WitchFlightVisual extends Visual {
       const alpha = this.wAnim[i * 4 + 3];
       if (alpha <= 0) continue;
       const size = this.wPos[i * 4 + 2];
-      const rate = (40 + size * 420) * (0.5 + this.speed * 0.6) * (i >= FLYERS ? 1.8 : 1);
+      const bandK = i < FLYERS ? 0.45 + audio.bands[4 + i * 6] * 1.3 : 1;
+      const rate = (40 + size * 420) * (0.5 + this.speed * 0.6) * (i >= FLYERS ? 1.8 : 1) * bandK;
+      const own = this.spell[i % 3];
       let n = rate * dt;
       if (audio.beat) n += 12 + size * 120;
       if (audio.drop) n += 40;
@@ -748,9 +815,36 @@ export class WitchFlightVisual extends Visual {
           -vy * 0.05 + Math.sin(a) * sp,
           (0.007 + Math.random() * 0.012) * (0.6 + size * 5),
           0.8 + Math.random() * 1.8,
+          Math.random() < 0.8 ? own : this.spell[(i + 1) % 3],
         );
       }
     }
+
+    // Snare: a random visible witch casts a ring of sparks
+    if (audio.midHit) {
+      this.flashEnv = 1;
+      this.winSeed.value = audio.midHitCount;
+      let w = -1;
+      const start = Math.floor(Math.random() * WITCHES);
+      for (let t = 0; t < WITCHES; t++) {
+        const j = (start + t) % WITCHES;
+        if (this.wAnim[j * 4 + 3] > 0 && Math.abs(this.wPos[j * 4]) < aspect / 2 && Math.abs(this.wPos[j * 4 + 1]) < 0.5) {
+          w = j;
+          break;
+        }
+      }
+      if (w >= 0) {
+        const size = this.wPos[w * 4 + 2];
+        const cx = this.wPos[w * 4];
+        const cy = this.wPos[w * 4 + 1];
+        const sp = 0.12 + size * 1.2 + audio.mid * 0.1;
+        for (let k = 0; k < RING; k++) {
+          const a = (k / RING) * Math.PI * 2;
+          this.emit(cx, cy, Math.cos(a) * sp, Math.sin(a) * sp, (0.012 + size * 0.05), 0.5 + Math.random() * 0.5, k % 4 ? accent : this.spell[0], 0.5);
+        }
+      }
+    }
+    this.flashEnv *= Math.exp(-dt * 4);
 
     // integrate sparks
     const drag = Math.exp(-1.6 * dt);
@@ -782,8 +876,15 @@ export class WitchFlightVisual extends Visual {
     this.skyU.treble.value = audio.treble;
     this.skyU.glow.value = this.glow;
     this.skyU.drop.value = audio.dropPulse;
+    this.skyU.glint.value = this.glintEnv;
+    this.skyU.flash.value = this.flashEnv;
+    this.skyU.bright.value = audio.brightness;
+    (this.skyU.accent.value as THREE.Color).copy(accent);
+    (this.skyU.horizon.value as THREE.Color).setRGB(0.32, 0.09, 0.03).lerp(this.spell[0], 0.12 + audio.brightness * 0.12);
     this.sparkU.time.value = time;
     this.sparkU.treble.value = Math.min(1, audio.treble * 1.5);
+    this.sparkU.glint.value = this.glintEnv;
+    this.winU.value = audio.mid * 0.6 + audio.midPulse * 1.2;
   }
 
   private writeWitch(i: number, x: number, y: number, size: number, dir: number, vx: number, vy: number, flap: number, haze: number, alpha: number) {

@@ -12,6 +12,17 @@ const DUST = 700;
 const MANSION_Z = -34;
 const MANSION_SCALE = 1.15;
 const WAVES = 4;
+const WIN_COLS = 9;
+const C = (r: number, g: number, b: number) => new THREE.Color(r, g, b);
+type Mood = { lo: THREE.Color; hi: THREE.Color; door: THREE.Color; sky: THREE.Color; mist: THREE.Color; ghostA: THREE.Color; ghostB: THREE.Color };
+/** Window/door/sky palettes — cycle every 32 beats, snap on drops. */
+const MOODS: Mood[] = [
+  { lo: C(1, 0.32, 0.08), hi: C(1, 0.6, 0.26), door: C(1, 0.375, 0.11), sky: C(0.07, 0.05, 0.12), mist: C(0.2, 0.17, 0.34), ghostA: C(0.27, 0.35, 1), ghostB: C(0.15, 1, 0.43) },
+  { lo: C(0.12, 0.75, 0.04), hi: C(0.45, 1, 0.2), door: C(0.35, 1, 0.12), sky: C(0.03, 0.065, 0.04), mist: C(0.08, 0.17, 0.11), ghostA: C(1, 0.2, 0.8), ghostB: C(0.4, 1, 0.3) },
+  { lo: C(0.6, 0.08, 0.9), hi: C(1, 0.4, 0.95), door: C(0.9, 0.25, 1), sky: C(0.08, 0.03, 0.12), mist: C(0.25, 0.12, 0.36), ghostA: C(0.3, 0.9, 1), ghostB: C(1, 0.6, 0.2) },
+  { lo: C(0.1, 0.4, 1), hi: C(0.5, 0.85, 1), door: C(0.4, 0.75, 1), sky: C(0.03, 0.05, 0.11), mist: C(0.11, 0.16, 0.29), ghostA: C(0.7, 0.3, 1), ghostB: C(0.3, 1, 0.8) },
+  { lo: C(0.9, 0.06, 0.04), hi: C(1, 0.55, 0.12), door: C(1, 0.2, 0.05), sky: C(0.09, 0.03, 0.05), mist: C(0.3, 0.12, 0.15), ghostA: C(1, 0.7, 0.2), ghostB: C(0.6, 0.2, 1) },
+];
 
 function rng(seed: number) {
   return () => {
@@ -164,15 +175,29 @@ export class HauntedMansionVisual extends Visual {
   private flapTime = 0;
   private orbit = 0;
   private boost = 0;
+  private col: Mood = {
+    lo: new THREE.Color(), hi: new THREE.Color(), door: new THREE.Color(), sky: new THREE.Color(),
+    mist: new THREE.Color(), ghostA: new THREE.Color(), ghostB: new THREE.Color(),
+  };
+  private doorMat!: THREE.MeshBasicMaterial;
+  private mood = 0;
+  private moodFrom = 0;
+  private moodMix = 1;
+  private moodSpeed = 0.4;
+  private beatsInMood = 0;
+  private knock = 0;
+  private redDoor = new THREE.Color(1, 0.14, 0.11);
 
   protected setup() {
     const rand = rng(4242);
+    this.applyMood(0.5);
     this.scene.fog = new THREE.FogExp2(FOG_COLOR, 0.016);
 
     // Stormy sky with lightning bolts.
     this.sky = fullscreenQuad(
       /* glsl */ `
-      uniform float time, flash, aspect, boltX, bolt, red;
+      uniform float time, flash, aspect, boltX, bolt, red, treble, hat, hatSeed;
+      uniform vec3 skyc;
       varying vec2 vUv;
       ${GLSL_NOISE}
       float fbm4(vec3 p) {
@@ -182,14 +207,16 @@ export class HauntedMansionVisual extends Visual {
       }
       void main() {
         vec2 p = (vUv - 0.5) * vec2(aspect, 1.0);
-        vec3 col = mix(vec3(0.05, 0.035, 0.09), vec3(0.008, 0.004, 0.02), smoothstep(-0.2, 0.5, p.y));
+        vec3 col = mix(skyc * 0.72, skyc * 0.13, smoothstep(-0.2, 0.5, p.y));
         float n = fbm4(vec3(p * vec2(1.4, 3.2) + vec2(time * 0.05, 0.0), time * 0.04));
         float n2 = fbm4(vec3(p * vec2(2.5, 5.0) - vec2(time * 0.09, 0.0), time * 0.06 + 4.0));
         float dens = smoothstep(-0.1, 0.6, n * 0.7 + n2 * 0.4);
-        col = mix(col, vec3(0.07, 0.05, 0.12) * (0.6 + n2 * 0.6), dens * smoothstep(-0.3, 0.2, p.y));
+        col = mix(col, skyc * (0.6 + n2 * 0.6), dens * smoothstep(-0.3, 0.2, p.y));
         vec2 sp = floor(vUv * vec2(aspect, 1.0) * 240.0);
         float h = hash21(sp);
-        col += step(0.9975, h) * smoothstep(0.05, 0.4, p.y) * (1.0 - dens) * (0.5 + 0.4 * sin(time * 3.0 + h * 50.0));
+        // stars twinkle harder with the highs; each hi-hat flares a fresh random third of them
+        float tw = 0.5 + 0.4 * sin(time * 3.0 + h * 50.0) + treble * 0.6 + hat * 2.2 * step(fract(h * 977.0 + hatSeed * 0.37), 0.33);
+        col += step(0.9975, h) * smoothstep(0.05, 0.4, p.y) * (1.0 - dens) * tw;
         // forked lightning bolt
         float by = p.y;
         float off = boltX + 0.06 * snoise(vec3(by * 6.0, boltX * 10.0, floor(time * 12.0) * 0.0 + boltX))
@@ -204,7 +231,10 @@ export class HauntedMansionVisual extends Visual {
         col = mix(col, col * vec3(1.6, 0.4, 0.45) + vec3(0.03, 0.0, 0.0), red * 0.7);
         gl_FragColor = vec4(col, 1.0);
       }`,
-      { time: { value: 0 }, flash: { value: 0 }, aspect: { value: 1 }, boltX: { value: 0 }, bolt: { value: 0 }, red: { value: 0 } },
+      {
+        time: { value: 0 }, flash: { value: 0 }, aspect: { value: 1 }, boltX: { value: 0 }, bolt: { value: 0 }, red: { value: 0 },
+        treble: { value: 0 }, hat: { value: 0 }, hatSeed: { value: 0 }, skyc: { value: this.col.sky },
+      },
     );
     this.scene.add(this.sky);
 
@@ -306,7 +336,7 @@ export class HauntedMansionVisual extends Visual {
     // Ground fog
     for (let i = 0; i < 3; i++) {
       const mat = new THREE.ShaderMaterial({
-        uniforms: { time: { value: 0 }, flash: { value: 0 }, density: { value: 0.5 }, seed: { value: i * 7.3 } },
+        uniforms: { time: { value: 0 }, flash: { value: 0 }, density: { value: 0.5 }, seed: { value: i * 7.3 }, mistc: { value: this.col.mist } },
         transparent: true,
         depthWrite: false,
         vertexShader: /* glsl */ `
@@ -318,6 +348,7 @@ export class HauntedMansionVisual extends Visual {
           }`,
         fragmentShader: /* glsl */ `
           uniform float time, flash, density, seed;
+          uniform vec3 mistc;
           varying vec3 vWorld;
           ${GLSL_NOISE}
           void main() {
@@ -325,7 +356,7 @@ export class HauntedMansionVisual extends Visual {
             float a = smoothstep(-0.2, 0.8, n) * density;
             float dist = length(vWorld.xz - cameraPosition.xz);
             a *= smoothstep(2.0, 8.0, dist) * (1.0 - smoothstep(40.0, 80.0, dist));
-            vec3 col = mix(vec3(0.2, 0.17, 0.34), vec3(0.8, 0.78, 1.0), flash);
+            vec3 col = mix(mistc, vec3(0.8, 0.78, 1.0), flash);
             gl_FragColor = vec4(col, a);
           }`,
       });
@@ -483,7 +514,6 @@ export class HauntedMansionVisual extends Visual {
     // Tower: tall column of five windows
     const tf = towerR * Math.cos(Math.PI / 8) + 0.01;
     for (let r = 0; r < 5; r++) spots.push({ x: 9.5, y: 1.0 + r * 2.8, z: 2.2 + tf, w: 1.1, h: 2.0, col: 8, row: r, rows: 5 });
-    const cols = 9;
     this.windowCount = spots.length;
 
     const wgeo = new THREE.PlaneGeometry(1, 1);
@@ -491,7 +521,7 @@ export class HauntedMansionVisual extends Visual {
     const winExtra = new Float32Array(spots.length * 2);
     const wmesh = new THREE.InstancedMesh(wgeo, new THREE.ShaderMaterial(), spots.length);
     spots.forEach((s, i) => {
-      winData[i * 4] = 0.04 + (s.col / (cols - 1)) * 0.62; // band (texture u)
+      winData[i * 4] = this.colU(s.col); // band (texture u)
       winData[i * 4 + 1] = s.row / s.rows;
       winData[i * 4 + 2] = 1 / s.rows;
       winData[i * 4 + 3] = rand();
@@ -513,6 +543,10 @@ export class HauntedMansionVisual extends Visual {
       uBoost: { value: 0 },
       uRed: { value: 0 },
       uFlash: { value: 0 },
+      uLo: { value: this.col.lo },
+      uHi: { value: this.col.hi },
+      uKnock: { value: 0 },
+      uKnockU: { value: -1 },
     };
     wmesh.material = new THREE.ShaderMaterial({
       uniforms: this.winUniforms,
@@ -533,7 +567,8 @@ export class HauntedMansionVisual extends Visual {
         }`,
       fragmentShader: /* glsl */ `
         uniform sampler2D uSpec;
-        uniform float uTime, uGhostId, uGhostT, uBoost, uRed, uFlash;
+        uniform float uTime, uGhostId, uGhostT, uBoost, uRed, uFlash, uKnock, uKnockU;
+        uniform vec3 uLo, uHi;
         varying vec2 vUv;
         varying vec4 vWin;
         varying vec2 vExtra;
@@ -559,13 +594,16 @@ export class HauntedMansionVisual extends Visual {
           float flick = 0.82 + 0.18 * sin(uTime * 13.0 + seed * 40.0) * sin(uTime * 7.3 + seed * 11.0);
           float idle = 0.05 + 0.1 * step(0.55, fract(seed * 13.7)) * (0.6 + 0.4 * sin(uTime * 0.7 + seed * 9.0));
           float ghost = step(abs(vExtra.x - uGhostId), 0.5);
-          lit = max(lit, ghost * 0.85);
+          // snare/clap "knock": one whole column of windows blazes up
+          float knock = uKnock * step(abs(vWin.x - uKnockU), 0.01);
+          lit = max(max(lit, ghost * 0.85), knock);
           float amt = max(lit, idle) * flick;
           // candle light pools at the bottom centre of the room
           float pool = 0.6 + 0.6 * exp(-dot(p - vec2(0.0, 0.25), p - vec2(0.0, 0.25)) * 6.0);
-          vec3 warm = mix(vec3(1.0, 0.32, 0.08), vec3(1.0, 0.6, 0.26), lit);
+          vec3 warm = mix(uLo, uHi, lit);
           warm = mix(warm, vec3(1.0, 0.1, 0.12), uRed);
-          vec3 col = warm * amt * pool * (0.9 + 0.7 * lit);
+          warm = mix(warm, vec3(1.0, 0.95, 0.85), knock * 0.45);
+          vec3 col = warm * amt * pool * (0.9 + 0.7 * lit + knock * 0.6);
           // a dark figure drifting past the glass
           if (ghost > 0.5) {
             float gx = mix(-0.55, 0.55, uGhostT);
@@ -587,10 +625,8 @@ export class HauntedMansionVisual extends Visual {
     group.add(wmesh);
 
     // Glowing doorway
-    const door = new THREE.Mesh(
-      new THREE.PlaneGeometry(1.4, 2.6),
-      new THREE.MeshBasicMaterial({ color: new THREE.Color(1.6, 0.6, 0.18) }),
-    );
+    this.doorMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(1.6, 0.6, 0.18) });
+    const door = new THREE.Mesh(new THREE.PlaneGeometry(1.4, 2.6), this.doorMat);
     door.position.set(0, 1.3, 5.02);
     group.add(door);
 
@@ -644,6 +680,33 @@ export class HauntedMansionVisual extends Visual {
     this.sky.material.uniforms.aspect.value = w / h;
   }
 
+  private colU(col: number) {
+    return 0.04 + (col / (WIN_COLS - 1)) * 0.62;
+  }
+
+  private applyMood(brightness: number) {
+    const m = this.moodMix * this.moodMix * (3 - 2 * this.moodMix);
+    const a = MOODS[this.moodFrom], b = MOODS[this.mood], c = this.col;
+    for (const k of ['lo', 'hi', 'door', 'sky', 'mist', 'ghostA', 'ghostB'] as const) c[k].copy(a[k]).lerp(b[k], m);
+    // airy, bright music shifts the window hue a touch and burns the lit rooms whiter
+    const h = (brightness - 0.5) * 0.06;
+    c.lo.offsetHSL(h, 0, 0);
+    c.hi.offsetHSL(h, 0, 0).lerp(PALETTE.bone, brightness * 0.3);
+  }
+
+  private updateMood(dt: number, audio: AudioFeatures) {
+    if (audio.beat) this.beatsInMood++;
+    if (audio.drop || this.beatsInMood >= 32) {
+      this.moodFrom = this.mood;
+      this.mood = (this.mood + 1 + (audio.drop ? Math.floor(Math.random() * 2) : 0)) % MOODS.length;
+      this.moodMix = 0;
+      this.moodSpeed = audio.drop ? 2.5 : 0.35;
+      this.beatsInMood = 0;
+    }
+    this.moodMix = Math.min(1, this.moodMix + dt * this.moodSpeed);
+    this.applyMood(audio.brightness);
+  }
+
   private emitDust(x: number, y: number, z: number, n: number, power: number) {
     for (let k = 0; k < n; k++) {
       const i = this.dustCursor;
@@ -670,6 +733,12 @@ export class HauntedMansionVisual extends Visual {
     }
     const sinceDrop = time - this.dropTime;
     const dropEnv = sinceDrop < 6 ? Math.exp(-sinceDrop * 0.6) : 0;
+    this.updateMood(dt, audio);
+    if (audio.midHit) {
+      this.knock = 1;
+      this.winUniforms.uKnockU.value = this.colU(Math.floor(Math.random() * WIN_COLS));
+    }
+    this.knock = Math.max(0, this.knock - dt * 3.2);
 
     // Lightning on drops and some heavy beats.
     if (audio.drop || (audio.beat && audio.bass > 0.6 && time - this.lastStrike > 5 && Math.random() < 0.3)) {
@@ -687,11 +756,16 @@ export class HauntedMansionVisual extends Visual {
     su.bolt.value = flash;
     su.boltX.value = this.boltX;
     su.red.value = dropEnv * 0.6;
+    su.treble.value = audio.treble;
+    su.hat.value = audio.treblePulse;
+    if (audio.trebleHit) su.hatSeed.value = audio.trebleHitCount % 101;
     this.moon.material.uniforms.glow.value = audio.bass + audio.beatPulse * 0.4;
     this.moon.material.uniforms.time.value = time;
     this.moonLight.intensity = 1.3 + flash * 4;
     this.hemi.intensity = 0.5 + flash * 1.6;
     (this.scene.fog as THREE.FogExp2).density = 0.016 + audio.bass * 0.004;
+    (this.scene.fog as THREE.FogExp2).color.copy(FOG_COLOR).lerp(this.col.sky, 0.04);
+    this.fill.color.copy(this.col.mist);
 
     // Windows
     this.boost = damp(this.boost, dropEnv > 0.3 ? 0.6 : 0, 4, dt);
@@ -700,6 +774,7 @@ export class HauntedMansionVisual extends Visual {
     wu.uBoost.value = this.boost + audio.beatPulse * 0.08;
     wu.uRed.value = sinceDrop < 5 ? Math.min(1, 1.6 - sinceDrop * 0.32) * Math.min(1, sinceDrop * 8) : 0;
     wu.uFlash.value = flash;
+    wu.uKnock.value = this.knock * this.knock;
     if (time > this.nextGhost) {
       this.ghostStart = time;
       wu.uGhostId.value = Math.floor(Math.random() * this.windowCount);
@@ -709,8 +784,9 @@ export class HauntedMansionVisual extends Visual {
     if (gt > 1) wu.uGhostId.value = -1;
     wu.uGhostT.value = Math.min(gt, 1);
     const candle = 0.85 + 0.15 * Math.sin(time * 11) * Math.sin(time * 4.3);
-    this.doorLight.intensity = (14 + audio.mid * 20 + dropEnv * 20) * candle;
-    this.doorLight.color.setRGB(1, 0.54 - dropEnv * 0.4, 0.23 - dropEnv * 0.12);
+    this.doorLight.intensity = (14 + audio.mid * 20 + this.knock * 14 + dropEnv * 20) * candle;
+    this.doorLight.color.copy(this.col.door).lerp(this.col.hi, 0.4).lerp(this.redDoor, dropEnv);
+    this.doorMat.color.copy(this.col.door).multiplyScalar(1.6 + this.knock * 0.8);
 
     // Gravestones: bands lift them, beat waves roll through the rows, drop makes them leap and slam.
     if (audio.beat) {
@@ -783,13 +859,14 @@ export class HauntedMansionVisual extends Visual {
       const l = this.graveLights[i];
       const t = time * (0.21 + i * 0.07) + i * 3;
       l.position.set(Math.sin(t) * 10, heightAt(0, 0) + 1.2 + Math.sin(t * 2.3) * 0.4, -2 + Math.cos(t * 0.8) * 7);
-      l.intensity = 3 + audio.treble * 10 + audio.beatPulse * 3;
+      l.intensity = 3 + audio.treble * 8 + audio.treblePulse * 5 + audio.beatPulse * 3;
+      l.color.copy(i ? this.col.ghostB : this.col.ghostA);
     }
 
     // Bats
     this.flapTime += dt * (16 + audio.level * 14);
     this.batUniforms.flapTime.value = this.flapTime;
-    this.batUniforms.eyes.value = 0.3 + audio.mid * 1.5 + dropEnv;
+    this.batUniforms.eyes.value = 0.3 + audio.mid * 1.5 + audio.midPulse * 1.2 + dropEnv;
     const cam = this.camera as THREE.PerspectiveCamera;
     const bm = this.bats.instanceMatrix.array as Float32Array;
     const speedK = 1 + audio.level * 1.2 + dropEnv * 1.5;

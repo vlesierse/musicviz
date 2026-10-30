@@ -8,6 +8,17 @@ import { Visual, damp, fullscreenQuad } from '../core/Visual';
 
 const WISPS = 260;
 const FOG_COLOR = new THREE.Color(0x140a22);
+const SPARKS_PER_HAT = 22;
+
+const lin = (r: number, g: number, b: number) => new THREE.Color().setRGB(r, g, b);
+/** Colour schemes [wispA, wispB, lantern flame, cloud tint]; cycled every 32 beats and on drops. */
+const SCHEMES: Array<[THREE.Color, THREE.Color, THREE.Color, THREE.Color]> = [
+  [PALETTE.toxic.clone(), new THREE.Color(0x30d8ff), new THREE.Color(0xffb050), lin(0.09, 0.05, 0.16)],
+  [new THREE.Color(0x7fe8ff), new THREE.Color(0x9b30ff), new THREE.Color(0xffd070), lin(0.03, 0.08, 0.13)],
+  [new THREE.Color(0xff2fb0), new THREE.Color(0x8a2be2), new THREE.Color(0x60ff30), lin(0.12, 0.03, 0.12)],
+  [new THREE.Color(0xff2a20), new THREE.Color(0xff8a10), new THREE.Color(0xff4010), lin(0.14, 0.03, 0.04)],
+  [PALETTE.toxic.clone(), new THREE.Color(0xffd040), new THREE.Color(0xb050ff), lin(0.05, 0.1, 0.04)],
+];
 
 /** Seeded random so the graveyard layout is the same every time. */
 function rng(seed: number) {
@@ -91,7 +102,7 @@ function pumpkinTextures() {
     }
     // Face centred at u = 0.25, which faces +z on a SphereGeometry.
     const cx = w * 0.25, cy = h * 0.5;
-    ctx.fillStyle = emissive ? '#ffd27a' : '#2a0b00';
+    ctx.fillStyle = emissive ? '#fff4e6' : '#2a0b00';
     for (const side of [-1, 1]) {
       ctx.beginPath();
       ctx.moveTo(cx + side * 8, cy - 4);
@@ -123,44 +134,71 @@ export class GraveyardVisual extends Visual {
   private pumpkinLights: THREE.PointLight[] = [];
   private wisps!: THREE.Points<THREE.BufferGeometry, THREE.PointsMaterial>;
   private wispBase = new Float32Array(WISPS * 4);
+  private trees: THREE.Mesh[] = [];
+  private wispBand = new Uint8Array(WISPS);
+  private wispSpark = new Float32Array(WISPS);
   private lightning = 0;
   private lastStrike = -10;
   private sway = 0;
+  private midFlare = 0;
+  private scheme = 0;
+  private schemeFrom = 0;
+  private schemeMix = 1;
+  private schemeSpeed = 0.35;
+  private beatsInScheme = 0;
+  private cols = [new THREE.Color(), new THREE.Color(), new THREE.Color(), new THREE.Color()];
+  private halo = new THREE.Color();
+  private fogGlow = new THREE.Color();
+  private tmp = new THREE.Color();
 
   protected setup() {
     const rand = rng(1031);
+    this.updateScheme(0, null);
     this.scene.fog = new THREE.FogExp2(FOG_COLOR, 0.03);
 
     this.sky = fullscreenQuad(
       /* glsl */ `
-      uniform float time, flash, aspect;
+      uniform float time, flash, aspect, treble, twinkle, twinkleSeed, mid;
+      uniform vec3 cloudCol;
       varying vec2 vUv;
       ${GLSL_NOISE}
       void main() {
         vec2 p = (vUv - 0.5) * vec2(aspect, 1.0);
         vec3 col = mix(${glslColor(FOG_COLOR)}, vec3(0.012, 0.004, 0.025), smoothstep(-0.15, 0.5, p.y));
         float clouds = fbm(vec3(p * vec2(1.5, 3.0) + vec2(time * 0.02, 0.0), time * 0.03));
-        col += vec3(0.09, 0.05, 0.16) * smoothstep(0.0, 0.7, clouds) * smoothstep(-0.2, 0.3, p.y);
+        col += cloudCol * (1.0 + mid * 0.8) * smoothstep(0.0, 0.7, clouds) * smoothstep(-0.2, 0.3, p.y);
         vec2 sp = floor(vUv * vec2(aspect, 1.0) * 220.0);
         float h = hash21(sp);
-        float star = step(0.997, h) * smoothstep(0.0, 0.4, p.y) * (0.6 + 0.4 * sin(time * 3.0 + h * 40.0));
+        // stars shimmer with the hats; a different handful flares on every hi-hat hit
+        float flare = twinkle * step(0.6, fract(h * 173.0 + twinkleSeed * 0.618)) * 2.5;
+        float star = step(0.997, h) * smoothstep(0.0, 0.4, p.y) * (0.6 + 0.4 * sin(time * (3.0 + treble * 9.0) + h * 40.0) + flare);
         col += star * 0.9 * (1.0 - smoothstep(0.0, 0.5, clouds));
         col += flash * vec3(0.5, 0.45, 0.9) * (0.6 + clouds);
         gl_FragColor = vec4(col, 1.0);
       }`,
-      { time: { value: 0 }, flash: { value: 0 }, aspect: { value: 1 } },
+      {
+        time: { value: 0 },
+        flash: { value: 0 },
+        aspect: { value: 1 },
+        treble: { value: 0 },
+        mid: { value: 0 },
+        twinkle: { value: 0 },
+        twinkleSeed: { value: 0 },
+        cloudCol: { value: this.cols[3] },
+      },
     );
     this.scene.add(this.sky);
 
     this.moon = new THREE.Mesh(
       new THREE.PlaneGeometry(1, 1),
       new THREE.ShaderMaterial({
-        uniforms: { glow: { value: 0 } },
+        uniforms: { glow: { value: 0 }, haloCol: { value: this.halo } },
         transparent: true,
         depthWrite: false,
         vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
         fragmentShader: /* glsl */ `
           uniform float glow;
+          uniform vec3 haloCol;
           varying vec2 vUv;
           ${GLSL_NOISE}
           void main() {
@@ -170,7 +208,7 @@ export class GraveyardVisual extends Visual {
             float craters = fbm(vec3(p * 4.0, 1.0)) * 0.5 + 0.5;
             vec3 moon = ${glslColor(PALETTE.moon)} * (0.75 + 0.5 * craters) * 1.5;
             float halo = exp(-max(r - 0.35, 0.0) * 7.0) * (0.3 + glow * 0.5);
-            vec3 col = moon * disc + ${glslColor(PALETTE.moon)} * halo * (1.0 - disc);
+            vec3 col = moon * disc + haloCol * halo * (1.0 - disc);
             gl_FragColor = vec4(col, max(disc, halo));
           }`,
       }),
@@ -224,12 +262,13 @@ export class GraveyardVisual extends Visual {
       t.position.set(x, heightAt(x, z) - 0.2, z);
       t.rotation.y = rand() * Math.PI * 2;
       t.scale.setScalar(1.3 + rand() * 0.8);
+      this.trees.push(t);
       this.scene.add(t);
     }
 
     // Jack-o'-lanterns lining the path
     const { map, emissiveMap } = pumpkinTextures();
-    this.pumpkinMat = new THREE.MeshStandardMaterial({ map, emissiveMap, emissive: 0xffffff, emissiveIntensity: 2, roughness: 0.7 });
+    this.pumpkinMat = new THREE.MeshStandardMaterial({ map, emissiveMap, emissive: 0xffb050, emissiveIntensity: 2, roughness: 0.7 });
     const pg = new THREE.SphereGeometry(0.42, 32, 16);
     const pp = pg.attributes.position as THREE.BufferAttribute;
     for (let i = 0; i < pp.count; i++) {
@@ -256,7 +295,7 @@ export class GraveyardVisual extends Visual {
     // Ground fog layers
     for (let i = 0; i < 3; i++) {
       const mat = new THREE.ShaderMaterial({
-        uniforms: { time: { value: 0 }, flash: { value: 0 }, density: { value: 0.5 }, seed: { value: i * 7.3 } },
+        uniforms: { time: { value: 0 }, flash: { value: 0 }, density: { value: 0.5 }, seed: { value: i * 7.3 }, glow: { value: this.fogGlow } },
         transparent: true,
         depthWrite: false,
         vertexShader: /* glsl */ `
@@ -268,6 +307,7 @@ export class GraveyardVisual extends Visual {
           }`,
         fragmentShader: /* glsl */ `
           uniform float time, flash, density, seed;
+          uniform vec3 glow;
           varying vec3 vWorld;
           ${GLSL_NOISE}
           void main() {
@@ -275,7 +315,7 @@ export class GraveyardVisual extends Visual {
             float a = smoothstep(-0.2, 0.8, n) * density;
             float dist = length(vWorld.xz - cameraPosition.xz);
             a *= smoothstep(1.0, 6.0, dist) * (1.0 - smoothstep(40.0, 90.0, dist));
-            vec3 col = mix(vec3(0.3, 0.24, 0.48), vec3(0.85, 0.82, 1.0), flash);
+            vec3 col = mix(vec3(0.3, 0.24, 0.48) + glow * (0.6 + 0.4 * n), vec3(0.85, 0.82, 1.0), flash);
             gl_FragColor = vec4(col, a);
           }`,
       });
@@ -291,15 +331,17 @@ export class GraveyardVisual extends Visual {
       this.wispBase[i * 4 + 1] = 0.4 + rand() * 3;
       this.wispBase[i * 4 + 2] = 14 - rand() * 70;
       this.wispBase[i * 4 + 3] = rand() * 100;
+      this.wispBand[i] = 2 + ((i * 7) % 54);
     }
     const wg = new THREE.BufferGeometry();
     wg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(WISPS * 3), 3));
+    wg.setAttribute('color', new THREE.BufferAttribute(new Float32Array(WISPS * 3), 3));
     this.wisps = new THREE.Points(
       wg,
       new THREE.PointsMaterial({
         map: dotTexture(),
         size: 0.35,
-        color: PALETTE.toxic.clone().multiplyScalar(1.6),
+        vertexColors: true,
         transparent: true,
         depthWrite: false,
         blending: THREE.AdditiveBlending,
@@ -320,7 +362,28 @@ export class GraveyardVisual extends Visual {
     if (this.sky) this.sky.material.uniforms.aspect.value = w / h;
   }
 
+  private updateScheme(dt: number, audio: AudioFeatures | null) {
+    if (audio) {
+      if (audio.beat) this.beatsInScheme++;
+      if (audio.drop || this.beatsInScheme >= 32) {
+        this.schemeFrom = this.scheme;
+        this.scheme = (this.scheme + 1 + (audio.drop ? Math.floor(Math.random() * 2) : 0)) % SCHEMES.length;
+        this.schemeMix = 0;
+        this.schemeSpeed = audio.drop ? 2.5 : 0.35;
+        this.beatsInScheme = 0;
+      }
+    }
+    this.schemeMix = Math.min(1, this.schemeMix + dt * this.schemeSpeed);
+    const m = this.schemeMix * this.schemeMix * (3 - 2 * this.schemeMix);
+    for (let k = 0; k < 4; k++) this.cols[k].copy(SCHEMES[this.schemeFrom][k]).lerp(SCHEMES[this.scheme][k], m);
+    // brighter music tints the moon halo toward the second wisp colour
+    this.halo.copy(PALETTE.moon).lerp(this.cols[1], 0.15 + (audio ? audio.brightness : 0) * 0.35);
+  }
+
   update(dt: number, time: number, audio: AudioFeatures) {
+    this.updateScheme(dt, audio);
+    if (audio.midHit) this.midFlare = 1;
+    this.midFlare = damp(this.midFlare, 0, 3, dt);
     // Lightning on drops and occasionally on heavy beats.
     if (audio.drop || (audio.beat && audio.bass > 0.65 && time - this.lastStrike > 4 && Math.random() < 0.25)) {
       this.lightning = 1;
@@ -332,14 +395,33 @@ export class GraveyardVisual extends Visual {
 
     this.sky.material.uniforms.time.value = time;
     this.sky.material.uniforms.flash.value = flash;
+    const su = this.sky.material.uniforms;
+    su.treble.value = damp(su.treble.value, audio.treble, 6, dt);
+    su.mid.value = damp(su.mid.value, audio.mid, 4, dt);
+    if (audio.trebleHit) {
+      su.twinkle.value = 1;
+      su.twinkleSeed.value = audio.trebleHitCount % 1000;
+    }
+    su.twinkle.value = damp(su.twinkle.value, 0, 5, dt);
     this.moon.material.uniforms.glow.value = audio.bass + audio.beatPulse * 0.5;
     this.moonLight.intensity = 1.4 + flash * 8;
     this.hemi.intensity = 0.6 + flash * 3;
     (this.scene.fog as THREE.FogExp2).density = 0.03 - audio.level * 0.008;
 
     const candle = 0.75 + 0.25 * Math.sin(time * 17) * Math.sin(time * 5.1);
-    this.pumpkinMat.emissiveIntensity = (1.4 + audio.mid * 2.5 + audio.beatPulse * 1.5) * candle;
-    for (const l of this.pumpkinLights) l.intensity = (4 + audio.mid * 8) * candle;
+    // lanterns flare on snares/claps; flame colour follows the scheme
+    this.pumpkinMat.emissive.copy(this.cols[2]);
+    this.pumpkinMat.emissiveIntensity = (1.3 + audio.mid * 1.8 + audio.beatPulse * 1.0 + this.midFlare * 2.2) * candle;
+    for (const l of this.pumpkinLights) {
+      l.color.copy(this.cols[2]);
+      l.intensity = (4 + audio.mid * 6 + this.midFlare * 8) * candle;
+    }
+    // each dead tree creaks in the wind with its own mid band
+    for (let i = 0; i < this.trees.length; i++) {
+      const b = audio.bands[18 + i * 4];
+      this.trees[i].rotation.z = Math.sin(time * 0.6 + i * 1.7) * 0.012 + Math.sin(time * 2.3 + i) * b * 0.035;
+    }
+    this.fogGlow.copy(this.cols[0]).multiplyScalar(0.06 + this.midFlare * 0.3 + audio.mid * 0.08);
 
     for (const f of this.fogLayers) {
       f.material.uniforms.time.value = time;
@@ -347,16 +429,29 @@ export class GraveyardVisual extends Visual {
       f.material.uniforms.density.value = 0.2 + audio.bass * 0.25;
     }
 
+    if (audio.trebleHit) {
+      for (let k = 0; k < SPARKS_PER_HAT; k++) this.wispSpark[Math.floor(Math.random() * WISPS)] = 1;
+    }
+    const sparkDecay = Math.exp(-3.5 * dt);
     const arr = this.wisps.geometry.attributes.position.array as Float32Array;
+    const col = this.wisps.geometry.attributes.color.array as Float32Array;
     for (let i = 0; i < WISPS; i++) {
       const b = i * 4;
+      // each wisp glows with its own band and sparkles on hi-hats
+      const sp = (this.wispSpark[i] *= sparkDecay);
+      const k = 0.55 + audio.bands[this.wispBand[i]] * 1.4 + sp * 2.2;
+      this.tmp.copy(this.cols[0]).lerp(this.cols[1], (i % 5) / 4 * 0.85 + sp * 0.15);
+      col[i * 3] = this.tmp.r * k;
+      col[i * 3 + 1] = this.tmp.g * k;
+      col[i * 3 + 2] = this.tmp.b * k;
       const ph = this.wispBase[b + 3] + time * 0.4;
       arr[i * 3] = this.wispBase[b] + Math.sin(ph) * 1.5;
       arr[i * 3 + 1] = this.wispBase[b + 1] + Math.sin(ph * 1.7) * 0.4;
       arr[i * 3 + 2] = this.wispBase[b + 2] + Math.cos(ph * 0.8) * 1.5;
     }
     this.wisps.geometry.attributes.position.needsUpdate = true;
-    this.wisps.material.size = 0.2 + audio.treble * 0.5 + audio.beatPulse * 0.15;
+    this.wisps.geometry.attributes.color.needsUpdate = true;
+    this.wisps.material.size = 0.22 + audio.treble * 0.35 + audio.treblePulse * 0.1 + audio.beatPulse * 0.1;
 
     // Slow walk down the path, looping, swaying side to side.
     this.sway += dt * (0.08 + audio.level * 0.1);

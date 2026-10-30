@@ -26,15 +26,42 @@ interface Group {
   energy: number;
   blinkStart: number;
   nextBlink: number;
+  flare: number; // mid-hit "noticed you": eyes snap wide, pupils pinch, glow surges
 }
 
-const COLORS: [number, number, number][] = [
-  [1.7, 0.06, 0.02], // blood red
-  [1.5, 0.12, 0.02], // red-orange
-  [1.5, 0.62, 0.05], // amber
-  [1.35, 1.05, 0.08], // sulphur yellow
-  [0.45, 1.5, 0.08], // toxic green
-  [0.8, 1.45, 0.12], // yellow-green
+const SLOTS = 6; // iris colour slots; slot 6 is the spiders
+const C = (r: number, g: number, b: number) => new THREE.Color(r, g, b);
+/** Iris palettes (LDR, boosted x1.6 in the shader) + fog tint. Cycles every 32 beats, snaps on drops. */
+interface Mood {
+  iris: THREE.Color[]; // SLOTS + 1 (spider)
+  fog: THREE.Color;
+}
+const MOODS: Mood[] = [
+  {
+    // classic: blood, ember, amber, sulphur, toxic
+    iris: [C(1, 0.035, 0.012), C(0.94, 0.075, 0.012), C(0.94, 0.39, 0.03), C(0.85, 0.66, 0.05), C(0.28, 0.94, 0.05), C(0.5, 0.9, 0.075), C(1, 0.06, 0.03)],
+    fog: C(0.02, 0.026, 0.032),
+  },
+  {
+    // witchfire: violets and magentas with the odd green
+    iris: [C(0.6, 0.1, 1), C(1, 0.1, 0.7), C(0.45, 0.05, 0.9), C(1, 0.3, 0.85), C(0.3, 1, 0.1), C(1, 0.5, 0.05), C(0.3, 1, 0.15)],
+    fog: C(0.026, 0.017, 0.036),
+  },
+  {
+    // spectral: ghost cyan and ice
+    iris: [C(0.05, 0.75, 1), C(0.25, 0.55, 1), C(0.03, 0.9, 0.65), C(0.1, 0.3, 1), C(0.45, 0.8, 1), C(0.55, 0.2, 1), C(0.8, 0.2, 1)],
+    fog: C(0.015, 0.027, 0.04),
+  },
+  {
+    // hellfire: crimson, scarlet, molten gold
+    iris: [C(1, 0.02, 0.05), C(1, 0.1, 0.02), C(1, 0.35, 0.02), C(1, 0.7, 0.1), C(1, 0.15, 0.3), C(0.9, 0.25, 0.02), C(1, 0.8, 0.15)],
+    fog: C(0.032, 0.015, 0.017),
+  },
+  {
+    // swamp: acid greens with a violet stranger
+    iris: [C(0.35, 0.95, 0.04), C(0.55, 0.9, 0.06), C(0.08, 0.9, 0.45), C(0.9, 0.75, 0.05), C(0.05, 0.85, 0.25), C(0.7, 0.15, 1), C(1, 0.25, 0.05)],
+    fog: C(0.017, 0.03, 0.021),
+  },
 ];
 
 /** Seeded RNG so the forest layout is the same every time. */
@@ -137,6 +164,7 @@ function treeCanvas(foreground: boolean) {
 
 const BG_FRAG = /* glsl */ `
 uniform float time, aspect, pan, dropPulse, glow;
+uniform vec3 uFog;
 varying vec2 vUv;
 ${GLSL_NOISE}
 void main() {
@@ -150,7 +178,7 @@ void main() {
   // drifting fog banks, thicker near the ground
   float f = fbm(vec3(p * vec2(1.4, 2.4) + vec2(time * 0.025 + pan, 0.0), time * 0.03));
   float fogAmt = smoothstep(-0.5, 0.7, f) * (0.35 + 0.9 * smoothstep(0.25, -0.5, p.y));
-  vec3 fogC = vec3(0.02, 0.026, 0.032) * (1.0 + glow * 0.8);
+  vec3 fogC = uFog * (1.0 + glow * 0.8);
   col = mix(col, fogC + col * 0.5, clamp(fogAmt, 0.0, 1.0));
   col += vec3(0.05, 0.0, 0.004) * dropPulse * fogAmt;
   gl_FragColor = vec4(col, 1.0);
@@ -159,6 +187,7 @@ void main() {
 const TREE_FRAG = /* glsl */ `
 uniform sampler2D map;
 uniform float pan, aspect, parallax, tone, time, glow, mist;
+uniform vec3 uFog;
 varying vec2 vUv;
 ${GLSL_NOISE}
 void main() {
@@ -169,7 +198,7 @@ void main() {
   if (mist > 0.0) {
     float m = fbm(vec3(p.x * 1.6 + time * 0.05, p.y * 4.5, time * 0.04));
     float amt = smoothstep(-0.3, 0.8, m) * smoothstep(-0.1, -0.5, p.y);
-    mc = vec3(0.028, 0.034, 0.042) * amt * mist * (1.0 + glow);
+    mc = uFog * 1.35 * amt * mist * (1.0 + glow);
   }
   // premultiplied: black silhouettes over everything, mist added on top
   gl_FragColor = vec4(mc * (1.0 - a), a);
@@ -178,8 +207,9 @@ void main() {
 const EYE_VERT = /* glsl */ `
 attribute vec4 aPos;   // x (aspect-normalised), y, size, depth
 attribute vec4 aShape; // angle, height, type, seed
-attribute vec4 aState; // open, bright, dilate, unused
-attribute vec3 aColor;
+attribute vec4 aState; // open, bright, dilate, glint
+attribute float aSlot;  // palette slot
+uniform vec3 uPal[${SLOTS + 1}];
 uniform float aspect, time, stare, pan;
 uniform vec2 target;
 varying vec2 vQ;
@@ -205,11 +235,14 @@ void main() {
   vLook = look * vec2(0.42, 0.22);
   vState = aState;
   vShape = aShape;
-  vCol = aColor;
+  int si = int(aSlot + 0.5);
+  vec3 pc = uPal[0];
+  for (int k = 1; k <= ${SLOTS}; k++) if (k == si) pc = uPal[k];
+  vCol = pc * 1.6;
 }`;
 
 const EYE_FRAG = /* glsl */ `
-uniform float stare;
+uniform float stare, treble;
 varying vec2 vQ;
 varying vec2 vLook;
 varying vec4 vState;
@@ -222,6 +255,8 @@ void main() {
   float open = vState.x;
   float bright = vState.y;
   float dil = vState.z;
+  float glint = vState.w;
+  float spec = 0.75 + 0.6 * treble + 2.2 * glint;
   float aa = fwidth(q.x) * 1.2;
   vec3 col = vec3(0.0);
   float d;
@@ -257,9 +292,13 @@ void main() {
       iris *= 1.0 - 0.97 * pupil;
       iris += vCol * 0.6 * exp(-abs(pd) * 18.0) * (1.0 - pupil); // hot ring around the pupil
       vec2 sp = qq - vec2(-0.32, h * 0.32);
-      iris += vec3(1.0, 0.95, 0.85) * exp(-dot(sp, sp) * 90.0) * 0.9;
+      iris += vec3(1.0, 0.95, 0.85) * exp(-dot(sp, sp) * 90.0) * spec;
       col = iris * smoothstep(aa, -aa, d) * vis;
     }
+    // hi-hat glint: a tiny four-point star off the wet highlight
+    vec2 gs = abs(qq - vec2(-0.32, h * 0.32));
+    col += vec3(1.0, 0.97, 0.9) * glint * vis * min(o, 1.0) * 0.55 *
+      (exp(-gs.y * 40.0 - gs.x * 3.2) + exp(-gs.x * 40.0 - gs.y * 3.2));
     col += vCol * 0.07 * (1.0 - 0.6 * stare) * exp(-max(d, 0.0) * 2.4) * smoothstep(${EXT.toFixed(1)}, 1.5, length(q)) * vis;
   } else {
     // spider: glassy orb with eyeshine
@@ -269,9 +308,11 @@ void main() {
       float n = sqrt(max(1.0 - r * r, 0.0));
       vec3 c = vCol * (0.02 + 0.35 * pow(1.0 - n, 3.0)) + vCol * 0.9 * exp(-dot(q - vec2(0.12, -0.25), q - vec2(0.12, -0.25)) * 6.0);
       vec2 sp = q - vec2(-0.35, 0.38);
-      c += vec3(1.0, 0.95, 0.9) * exp(-dot(sp, sp) * 40.0) * 1.4;
+      c += vec3(1.0, 0.95, 0.9) * exp(-dot(sp, sp) * 40.0) * 1.4 * spec / 0.9;
       col = c * smoothstep(aa, -aa, d);
     }
+    vec2 gs = abs(q - vec2(-0.35, 0.38));
+    col += vec3(1.0, 0.97, 0.9) * glint * 0.5 * (exp(-gs.y * 30.0 - gs.x * 2.6) + exp(-gs.x * 30.0 - gs.y * 2.6));
     col += vCol * 0.05 * exp(-max(d, 0.0) * 2.0) * smoothstep(${EXT.toFixed(1)}, 1.5, r);
   }
   gl_FragColor = vec4(col * bright, 1.0);
@@ -291,7 +332,15 @@ export class EyesInTheDarkVisual extends Visual {
   private pos = new Float32Array(MAX_EYES * 4);
   private shape = new Float32Array(MAX_EYES * 4);
   private state = new Float32Array(MAX_EYES * 4);
-  private color = new Float32Array(MAX_EYES * 3);
+  private slot = new Float32Array(MAX_EYES);
+  private glint = new Float32Array(MAX_EYES);
+  private pal: THREE.Color[] = Array.from({ length: SLOTS + 1 }, () => new THREE.Color());
+  private fog = new THREE.Color();
+  private mood = 0;
+  private moodFrom = 0;
+  private moodMix = 1;
+  private moodSpeed = 0.35;
+  private beatsInMood = 0;
   private posAttr!: THREE.InstancedBufferAttribute;
   private stateAttr!: THREE.InstancedBufferAttribute;
   private count = 0;
@@ -304,7 +353,8 @@ export class EyesInTheDarkVisual extends Visual {
 
   protected setup() {
     this.camera = new THREE.OrthographicCamera(-0.5, 0.5, 0.5, -0.5, -1, 1);
-    this.bgU = { time: { value: 0 }, aspect: { value: 1 }, pan: { value: 0 }, dropPulse: { value: 0 }, glow: { value: 0 } };
+    this.applyMood(0.5);
+    this.bgU = { time: { value: 0 }, aspect: { value: 1 }, pan: { value: 0 }, dropPulse: { value: 0 }, glow: { value: 0 }, uFog: { value: this.fog } };
     this.quad = fullscreenQuad(BG_FRAG, this.bgU);
     this.scene.add(this.quad);
 
@@ -315,8 +365,10 @@ export class EyesInTheDarkVisual extends Visual {
     this.posAttr = new THREE.InstancedBufferAttribute(this.pos, 4).setUsage(THREE.DynamicDrawUsage);
     this.stateAttr = new THREE.InstancedBufferAttribute(this.state, 4).setUsage(THREE.DynamicDrawUsage);
     const shapeAttr = new THREE.InstancedBufferAttribute(this.shape, 4);
-    const colAttr = new THREE.InstancedBufferAttribute(this.color, 3);
+    const slotAttr = new THREE.InstancedBufferAttribute(this.slot, 1);
     this.eyeU = {
+      uPal: { value: this.pal },
+      treble: { value: 0 },
       aspect: { value: 1 },
       time: { value: 0 },
       stare: { value: 0 },
@@ -346,7 +398,7 @@ export class EyesInTheDarkVisual extends Visual {
       geo.setAttribute('aPos', this.posAttr);
       geo.setAttribute('aShape', shapeAttr);
       geo.setAttribute('aState', this.stateAttr);
-      geo.setAttribute('aColor', colAttr);
+      geo.setAttribute('aSlot', slotAttr);
       geo.instanceCount = n;
       this.geos.push(geo);
       const m = new THREE.Mesh(geo, mat);
@@ -370,6 +422,7 @@ export class EyesInTheDarkVisual extends Visual {
           time: { value: 0 },
           glow: { value: 0 },
           mist: { value: fg ? 1.0 : 0.0 },
+          uFog: { value: this.fog },
         },
         transparent: true,
         depthTest: false,
@@ -400,7 +453,7 @@ export class EyesInTheDarkVisual extends Visual {
     geo.setAttribute('aPos', this.farMidAttrs[0]);
     geo.setAttribute('aState', this.farMidAttrs[1]);
     geo.setAttribute('aShape', sub(this.shape, 4, false));
-    geo.setAttribute('aColor', sub(this.color, 3, false));
+    geo.setAttribute('aSlot', sub(this.slot, 1, false));
   }
   private farMidAttrs: THREE.InstancedBufferAttribute[] = [];
 
@@ -459,6 +512,7 @@ export class EyesInTheDarkVisual extends Visual {
           energy: 0,
           blinkStart: -10,
           nextBlink: rng() * 6,
+          flare: 0,
         };
         if (spider) {
           const s = size * 0.42;
@@ -487,7 +541,7 @@ export class EyesInTheDarkVisual extends Visual {
     groups.sort((a, b) => a.layer - b.layer);
     let idx = 0;
     for (const g of groups) {
-      const c = COLORS[Math.floor(rng() * COLORS.length)];
+      const c = Math.floor(rng() * SLOTS);
       const tilt = 0.12 + rng() * 0.22;
       const h = g.type === 1 ? 0.55 : 0.42 + rng() * 0.16;
       for (let e = 0; e < g.sizes.length; e++) {
@@ -498,10 +552,7 @@ export class EyesInTheDarkVisual extends Visual {
         this.shape[idx * 4 + 1] = h;
         this.shape[idx * 4 + 2] = g.type;
         this.shape[idx * 4 + 3] = g.seed + e * 0.137;
-        const tint = g.type === 2 ? [1.6, 0.1, 0.05] : c;
-        this.color[idx * 3] = tint[0];
-        this.color[idx * 3 + 1] = tint[1];
-        this.color[idx * 3 + 2] = tint[2];
+        this.slot[idx] = g.type === 2 ? SLOTS : c;
         idx++;
       }
     }
@@ -517,6 +568,18 @@ export class EyesInTheDarkVisual extends Visual {
   update(dt: number, time: number, audio: AudioFeatures) {
     const aspect = this.width / this.height;
     this.level = damp(this.level, audio.level, 3, dt);
+    this.updateMood(dt, audio);
+
+    // a mid hit: a few creatures suddenly notice you (hidden ones peek out)
+    if (audio.midHit && this.stareTimer <= 0) {
+      const n = 2 + Math.floor(Math.random() * 3);
+      for (let k = 0; k < n; k++) this.groups[Math.floor(Math.random() * this.groups.length)].flare = 1;
+    }
+    // hi-hats catch the wet highlight on a scatter of eyes
+    if (audio.trebleHit) {
+      for (let i = 0; i < this.count; i++) if (Math.random() < 0.2) this.glint[i] = 1;
+    }
+    const glintDecay = Math.exp(-dt * 9);
     if (audio.drop) {
       this.stareTimer = 3.2;
       for (const g of this.groups) {
@@ -543,9 +606,11 @@ export class EyesInTheDarkVisual extends Visual {
     for (const g of this.groups) {
       g.energy = damp(g.energy, audio.bands[g.band], 12, dt);
       const e = smoothstep(0.05, 0.45, g.energy);
-      const vis = g.hidden ? this.reveal : 1;
-      let openT = (0.3 + 0.75 * e) * vis;
-      let brightT = (0.4 + 0.9 * e + audio.beatPulse * 0.15) * vis;
+      g.flare = Math.max(0, g.flare - dt * 2.4);
+      const fl = g.flare * g.flare;
+      const vis = g.hidden ? Math.max(this.reveal, fl) : 1;
+      let openT = (0.3 + 0.75 * e + 0.55 * fl) * vis;
+      let brightT = (0.4 + 0.9 * e + audio.beatPulse * 0.15 + 1.1 * fl) * vis;
       openT = lerp(openT, g.type === 1 ? 1.25 : 1.4, this.stare);
       brightT = lerp(brightT, 0.62, this.stare);
       g.open = damp(g.open, openT, this.stare > 0.5 ? 18 : 9, dt);
@@ -565,7 +630,7 @@ export class EyesInTheDarkVisual extends Visual {
       }
       lid = Math.max(0, lid);
       const fogDim = 1 - g.depth * 0.3;
-      const dil = lerp(0.35 + e * 0.45, 0.05, this.stare);
+      const dil = lerp(lerp(0.35 + e * 0.45, 0.0, fl), 0.05, this.stare);
       const sway = 0.004 + (2 - g.layer) * 0.0015;
       const sx = Math.sin(time * 0.31 + g.seed * 20) * sway;
       const sy = Math.sin(time * 0.23 + g.seed * 31) * sway * 0.5;
@@ -578,6 +643,8 @@ export class EyesInTheDarkVisual extends Visual {
         this.state[i * 4] = g.type === 2 ? 1 : g.open * lid;
         this.state[i * 4 + 1] = g.bright * fogDim * (g.type === 2 ? 0.4 + 0.6 * lid : 1);
         this.state[i * 4 + 2] = dil;
+        this.glint[i] *= glintDecay;
+        this.state[i * 4 + 3] = this.glint[i];
       }
       glowSum += g.bright * g.open * (g.layer + 1);
     }
@@ -595,6 +662,7 @@ export class EyesInTheDarkVisual extends Visual {
     this.eyeU.time.value = time;
     this.eyeU.pan.value = pan;
     this.eyeU.stare.value = this.stare;
+    this.eyeU.treble.value = audio.treble;
     (this.eyeU.target.value as THREE.Vector2).set(
       0.32 * Math.sin(time * 0.21) + 0.12 * Math.sin(time * 0.57 + 1.3),
       0.18 * Math.sin(time * 0.29 + 0.7) - 0.05 + 0.08 * Math.sin(time * 0.71),
@@ -604,6 +672,28 @@ export class EyesInTheDarkVisual extends Visual {
       m.uniforms.time.value = time;
       m.uniforms.glow.value = this.glow;
     }
+  }
+
+  private applyMood(brightness: number) {
+    const m = this.moodMix * this.moodMix * (3 - 2 * this.moodMix);
+    const a = MOODS[this.moodFrom], b = MOODS[this.mood];
+    // airy music nudges every iris hue one way, dark bassy music the other
+    const h = (brightness - 0.5) * 0.08;
+    for (let k = 0; k <= SLOTS; k++) this.pal[k].copy(a.iris[k]).lerp(b.iris[k], m).offsetHSL(h, 0, 0);
+    this.fog.copy(a.fog).lerp(b.fog, m);
+  }
+
+  private updateMood(dt: number, audio: AudioFeatures) {
+    if (audio.beat) this.beatsInMood++;
+    if (audio.drop || this.beatsInMood >= 32) {
+      this.moodFrom = this.mood;
+      this.mood = (this.mood + 1 + (audio.drop ? Math.floor(Math.random() * 2) : 0)) % MOODS.length;
+      this.moodMix = 0;
+      this.moodSpeed = audio.drop ? 2.5 : 0.35;
+      this.beatsInMood = 0;
+    }
+    this.moodMix = Math.min(1, this.moodMix + dt * this.moodSpeed);
+    this.applyMood(audio.brightness);
   }
 
   resize(w: number, h: number) {

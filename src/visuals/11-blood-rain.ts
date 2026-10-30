@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import type { AudioFeatures } from '../audio/features';
 import { FULLSCREEN_VERT, GLSL_NOISE } from '../core/glsl';
-import { Visual, damp, fullscreenQuad } from '../core/Visual';
+import { SpectrumTexture, Visual, damp, fullscreenQuad } from '../core/Visual';
 
 const RAIN = 3000;
 const SPLASH = 2400;
@@ -13,9 +13,21 @@ const Z_NEAR = 6.5;
 const Z_FAR = -26;
 const GRAVITY = 9.8;
 
+const C = (r: number, g: number, b: number) => new THREE.Color(r, g, b);
+/** Storm moods (the rain and pool always stay blood): [horizon fog, moon, lightning]. */
+const MOODS: THREE.Color[][] = [
+  [C(0.1, 0.004, 0.01), C(1.0, 0.86, 0.8), C(0.6, 0.35, 1.0)], // crimson fog, violet lightning
+  [C(0.08, 0.004, 0.06), C(0.85, 0.75, 1.0), C(0.35, 0.75, 1.0)], // purple fog, cyan lightning
+  [C(0.09, 0.03, 0.004), C(1.0, 0.72, 0.4), C(1.0, 0.3, 0.75)], // ember fog, magenta lightning
+  [C(0.025, 0.02, 0.07), C(0.75, 0.88, 1.0), C(0.45, 1.0, 0.95)], // cold ghost fog, teal lightning
+  [C(0.035, 0.055, 0.008), C(0.85, 1.0, 0.65), C(0.75, 1.0, 0.35)], // sickly green fog, acid lightning
+];
+
 /** Shared sky function (also used for pool reflections). */
 const SKY_GLSL = /* glsl */ `
-uniform float time, moonRed, level, treble;
+uniform float time, moonRed, level, treble, flash, boltX, boltSeed;
+uniform vec3 fogC, moonC, boltC;
+uniform sampler2D tSpectrum;
 const vec3 MOON_DIR = normalize(vec3(0.42, 0.3, -1.0));
 float fbm3(vec3 p) {
   float f = 0.0, a = 0.5;
@@ -43,10 +55,11 @@ float skyline(float az) {
 }
 vec3 sky(vec3 d) {
   float y = d.y;
-  vec3 col = mix(vec3(0.03, 0.004, 0.012), vec3(0.004, 0.001, 0.008), smoothstep(0.0, 0.6, y));
+  vec3 col = mix(vec3(0.02, 0.002, 0.006) + fogC * 0.12, vec3(0.004, 0.001, 0.008), smoothstep(0.0, 0.6, y));
+  float az = atan(d.x, -d.z);
   // moon
   float md = acos(clamp(dot(d, MOON_DIR), -1.0, 1.0));
-  vec3 moonCol = mix(vec3(1.0, 0.86, 0.8), vec3(1.0, 0.08, 0.04), moonRed);
+  vec3 moonCol = mix(moonC, vec3(1.0, 0.08, 0.04), moonRed);
   float disc = smoothstep(0.072, 0.068, md);
   vec2 mp = vec2(d.x - MOON_DIR.x, d.y - MOON_DIR.y) * 14.0;
   float cr = fbm3(vec3(mp * 1.5, 2.0));
@@ -57,12 +70,23 @@ vec3 sky(vec3 d) {
   float n = fbm3(vec3(cp, time * 0.02));
   float dens = smoothstep(-0.05, 0.6, n) * smoothstep(0.02, 0.15, y);
   vec3 cloud = mix(vec3(0.03, 0.006, 0.01), moonCol * 0.32, exp(-md * 4.0));
+  // snare lightning: the clouds around the strike light up and a jagged bolt drops to the horizon
+  float boltGlow = 0.0;
+  if (flash > 0.01) {
+    boltGlow = flash * exp(-abs(az - boltX) * 3.5);
+    cloud += boltC * boltGlow * (0.25 + 0.9 * smoothstep(-0.1, 0.6, n));
+    col += boltC * boltGlow * 0.06 * smoothstep(-0.02, 0.3, y);
+    float bx = boltX + 0.025 * snoise(vec3(y * 14.0, boltSeed, 0.0)) + 0.008 * snoise(vec3(y * 60.0, boltSeed, 1.0));
+    float bolt = exp(-abs(az - bx) * 900.0) * step(0.0, y) * smoothstep(0.42, 0.25, y) * step(0.45, flash);
+    col += mix(boltC, vec3(1.0), 0.6) * bolt * 1.6;
+  }
   col = mix(col, cloud * (0.55 + 0.45 * n), dens * 0.8);
-  // red fog at the horizon
+  // fog at the horizon; each direction swells with its own spectrum band
   float fogN = 0.6 + 0.4 * snoise(vec3(d.x * 4.0 + time * 0.05, y * 6.0, time * 0.04));
-  col += vec3(0.1, 0.004, 0.01) * exp(-abs(y) * 10.0) * fogN * (0.7 + level * 0.6);
+  float fb = texture2D(tSpectrum, vec2(clamp(az * 0.55 + 0.5, 0.02, 0.85), 0.5)).r;
+  col += fogC * exp(-abs(y) * 10.0) * fogN * (0.55 + level * 0.4 + fb * 0.9);
+  col += boltC * exp(-abs(y) * 8.0) * boltGlow * 0.05;
   // silhouettes
-  float az = atan(d.x, -d.z);
   float sil = smoothstep(0.002, -0.002, y - skyline(az)) * step(-0.01, y);
   col = mix(col, vec3(0.012, 0.0, 0.004) + vec3(0.05, 0.0, 0.006) * exp(-y * 30.0), sil);
   return col;
@@ -174,6 +198,16 @@ export class BloodRainVisual extends Visual {
   private enterTime = -1;
   private nextDrip = 0;
   private bigQueue = 0;
+  private spectrum = new SpectrumTexture(64);
+  private mood = MOODS[0].map((c) => c.clone());
+  private moodIdx = 0;
+  private moodFrom = 0;
+  private moodMix = 1;
+  private moodSpeed = 0.35;
+  private lastMoodBeat = 0;
+  private flash = 0;
+  private sparkle = 0;
+  private tmpC = new THREE.Color();
 
   protected setup() {
     const cam = this.camera as THREE.PerspectiveCamera;
@@ -190,7 +224,7 @@ export class BloodRainVisual extends Visual {
       /* glsl */ `
       uniform mat4 camWorld, projInv;
       uniform vec3 camPos;
-      uniform float poolY, swell, rainDens;
+      uniform float poolY, swell, rainDens, sparkle, seed;
       uniform vec4 ripples[${RIPPLES}];
       varying vec2 vUv;
       ${GLSL_NOISE}
@@ -254,16 +288,16 @@ export class BloodRainVisual extends Visual {
           refl = refl / (1.0 + refl * 2.5);
           col = vec3(0.016, 0.0, 0.001) + vec3(0.05, 0.0, 0.003) * max(dot(N, normalize(vec3(-0.3, 0.6, 0.5))), 0.0);
           col += refl * (0.1 + 0.9 * fres) * vec3(1.0, 0.55, 0.55);
-          float glints = step(0.996 - treble * 0.008, hash21(floor(P.xz * 30.0) + floor(time * 8.0))) * fade;
+          float glints = step(0.996 - treble * 0.008 - sparkle * 0.01, hash21(floor(P.xz * 30.0) + floor(time * 8.0) + seed)) * fade;
           float spec = pow(max(dot(R, MOON_DIR), 0.0), 900.0);
-          col += vec3(1.0, 0.7, 0.7) * (spec * 1.2 + glints * 0.25 * (0.5 + treble));
+          col += vec3(1.0, 0.7, 0.7) * (spec * 1.2 + glints * 0.25 * (0.5 + treble + sparkle));
           // horizon fog
-          col = mix(col, vec3(0.06, 0.003, 0.008) * (0.8 + level * 0.5), smoothstep(14.0, 70.0, t) * 0.8);
+          col = mix(col, mix(vec3(0.06, 0.003, 0.008), fogC * 0.6, 0.45) * (0.8 + level * 0.5) + boltC * flash * 0.02, smoothstep(14.0, 70.0, t) * 0.8);
         } else {
           col = sky(dir);
           // fine drifting mist that sparkles with the treble
           float mist = fbm3(vec3(vUv * vec2(6.0, 3.0) + vec2(time * 0.05, -time * 0.4), time * 0.1));
-          col += vec3(0.05, 0.004, 0.008) * smoothstep(0.1, 0.8, mist) * (0.3 + treble);
+          col += mix(vec3(0.05, 0.004, 0.008), fogC * 0.5, 0.5) * smoothstep(0.1, 0.8, mist) * (0.3 + treble + sparkle * 0.5);
         }
         gl_FragColor = vec4(col, 1.0);
       }`,
@@ -279,6 +313,15 @@ export class BloodRainVisual extends Visual {
         swell: { value: 0.05 },
         rainDens: { value: 0.3 },
         ripples: { value: this.ripples },
+        fogC: { value: this.mood[0] },
+        moonC: { value: this.mood[1] },
+        boltC: { value: this.mood[2] },
+        flash: { value: 0 },
+        boltX: { value: 0 },
+        boltSeed: { value: 0 },
+        sparkle: { value: 0 },
+        seed: { value: 0 },
+        tSpectrum: { value: this.spectrum.texture },
       },
     );
     this.scene.add(this.quad);
@@ -487,6 +530,25 @@ export class BloodRainVisual extends Visual {
 
   onEnter() {
     this.enterTime = -1;
+    this.moodMix = 1;
+    this.applyMood(0, 0);
+  }
+
+  private nextMood(speed: number, jump = 1) {
+    this.moodFrom = this.moodIdx;
+    this.moodIdx = (this.moodIdx + jump) % MOODS.length;
+    this.moodMix = 0;
+    this.moodSpeed = speed;
+  }
+
+  private applyMood(dt: number, brightness: number) {
+    this.moodMix = Math.min(1, this.moodMix + dt * this.moodSpeed);
+    const m = this.moodMix * this.moodMix * (3 - 2 * this.moodMix);
+    const a = MOODS[this.moodFrom];
+    const b = MOODS[this.moodIdx];
+    for (let k = 0; k < 3; k++) this.mood[k].copy(a[k]).lerp(b[k], m);
+    // brighter music pulls the fog toward the lightning hue
+    this.mood[0].lerp(this.tmpC.copy(this.mood[2]).multiplyScalar(0.09), brightness * 0.35);
   }
 
   update(dt: number, time: number, audio: AudioFeatures) {
@@ -505,6 +567,36 @@ export class BloodRainVisual extends Visual {
     this.density = damp(this.density, 0.25 + audio.level * 0.75, 2, dt);
     this.speed = damp(this.speed, 0.8 + audio.level * 0.6 + audio.dropPulse * 0.4, 2, dt);
     if (audio.beat) this.bigQueue += 6 + Math.floor(audio.bass * 14);
+    if (audio.drop) {
+      this.nextMood(2.5, 1 + Math.floor(Math.random() * 2));
+      this.lastMoodBeat = audio.beatCount;
+    } else if (audio.beat && audio.beatCount - this.lastMoodBeat >= 32) {
+      this.nextMood(0.35);
+      this.lastMoodBeat = audio.beatCount;
+    }
+    this.applyMood(dt, audio.brightness);
+    this.spectrum.update(audio.bands);
+    const u = this.quad.material.uniforms;
+    // snare: lightning somewhere on the horizon and a fat drop hitting the pool
+    if (audio.midHit) {
+      this.flash = 0.8 + audio.mid * 0.5;
+      u.boltX.value = (Math.random() * 2 - 1) * 0.55;
+      u.boltSeed.value = Math.random() * 50;
+      this.crown((Math.random() * 2 - 1) * 3, -2 + Math.random() * 6, 0.9 + audio.mid * 0.5);
+    }
+    this.flash *= Math.exp(-5 * dt);
+    // hats: re-seed the pool glints and kick up a fine mist of droplets
+    if (audio.trebleHit) {
+      this.sparkle = Math.min(1.2, this.sparkle + 0.5 + audio.treble * 0.6);
+      u.seed.value = Math.random() * 100;
+      for (let k = 0; k < 10; k++) {
+        const x = (Math.random() * 2 - 1) * 5;
+        const z = -6 + Math.random() * 10;
+        const a = Math.random() * Math.PI * 2;
+        this.emitSplash(x, this.poolY, z, Math.cos(a) * 0.4, 0.8 + Math.random() * 1.2, Math.sin(a) * 0.4, 0.006 + Math.random() * 0.005, 0.8);
+      }
+    }
+    this.sparkle = damp(this.sparkle, audio.treble * 0.2, 6, dt);
     if (audio.drop) {
       this.bigQueue += 40;
       this.sweepY = 1.25;
@@ -599,15 +691,16 @@ export class BloodRainVisual extends Visual {
     cam.lookAt(0, 1.0, 0);
     cam.updateMatrixWorld();
 
-    const u = this.quad.material.uniforms;
     u.time.value = time;
+    u.flash.value = this.flash * (0.7 + 0.3 * Math.sin(time * 70) * Math.sin(time * 23));
+    u.sparkle.value = this.sparkle;
     u.moonRed.value = damp(u.moonRed.value, Math.min(1, 0.25 + audio.dropPulse * 1.2), 3, dt);
     u.level.value = audio.level;
     u.treble.value = audio.treble;
     u.poolY.value = this.poolY;
     u.swell.value = damp(u.swell.value, 0.03 + audio.bass * 0.12 + audio.beatPulse * 0.04, 6, dt);
     u.rainDens.value = 0.1 + this.density * 0.6;
-    this.dropMat.uniforms.glint.value = audio.treble * 1.5;
+    this.dropMat.uniforms.glint.value = audio.treble * 1.5 + this.sparkle;
 
     const l = this.lens.uniforms;
     l.time.value = time;

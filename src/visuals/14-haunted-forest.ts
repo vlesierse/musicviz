@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import type { AudioFeatures } from '../audio/features';
 import { GLSL_NOISE } from '../core/glsl';
-import { PALETTE, glslColor } from '../core/palette';
+import { PALETTE } from '../core/palette';
 import { dotTexture } from '../core/shapes';
 import { Visual, damp, fullscreenQuad } from '../core/Visual';
 
@@ -12,6 +12,17 @@ const WISPS = 7;
 const FOG_COLOR = new THREE.Color(0.022, 0.024, 0.045);
 const FACE_HEIGHT = 2.1;
 const FACE_TRUNK_R = 0.5;
+const FACE_BANDS = [4, 10, 16, 22, 30, 38, 46, 54];
+const C = (r: number, g: number, b: number) => new THREE.Color(r, g, b);
+type Mood = { faceA: THREE.Color; faceB: THREE.Color; wisp: THREE.Color; mist: THREE.Color; leafA: THREE.Color; leafB: THREE.Color; fog: THREE.Color; moon: THREE.Color };
+/** Cycles every 32 beats, snaps on drops (the blood-red drop mode still overrides for a few seconds). */
+const MOODS: Mood[] = [
+  { faceA: PALETTE.candle.clone(), faceB: PALETTE.ember.clone(), wisp: C(0.28, 0.78, 1), mist: C(0.16, 0.17, 0.3), leafA: PALETTE.pumpkin.clone(), leafB: PALETTE.candle.clone(), fog: FOG_COLOR.clone(), moon: C(0.75, 0.8, 1) },
+  { faceA: C(0.55, 1, 0.2), faceB: C(0.1, 0.8, 0.05), wisp: C(0.75, 0.3, 1), mist: C(0.1, 0.2, 0.13), leafA: PALETTE.slime.clone(), leafB: C(0.9, 1, 0.2), fog: C(0.014, 0.034, 0.024), moon: C(0.8, 1, 0.75) },
+  { faceA: C(1, 0.35, 0.95), faceB: C(0.5, 0.08, 0.95), wisp: C(1, 0.7, 0.25), mist: C(0.2, 0.11, 0.3), leafA: C(0.75, 0.2, 1), leafB: C(1, 0.35, 0.6), fog: C(0.034, 0.016, 0.05), moon: C(0.9, 0.75, 1) },
+  { faceA: C(0.65, 0.95, 1), faceB: C(0.1, 0.4, 1), wisp: C(0.45, 1, 0.55), mist: C(0.11, 0.19, 0.28), leafA: C(0.3, 0.8, 1), leafB: C(0.85, 0.95, 1), fog: C(0.01, 0.028, 0.05), moon: C(0.7, 0.9, 1) },
+  { faceA: C(1, 0.8, 0.2), faceB: C(1, 0.3, 0), wisp: C(1, 0.25, 0.75), mist: C(0.08, 0.2, 0.2), leafA: C(1, 0.55, 0.05), leafB: C(1, 0.15, 0.05), fog: C(0.01, 0.034, 0.034), moon: C(1, 0.9, 0.7) },
+];
 
 function rng(seed: number) {
   return () => {
@@ -137,37 +148,52 @@ export class HauntedForestVisual extends Visual {
   private dropTime = -100;
   private lookTarget = new THREE.Vector3();
   private redFog = new THREE.Color(0.06, 0.004, 0.006);
+  private col: Mood = {
+    faceA: new THREE.Color(), faceB: new THREE.Color(), wisp: new THREE.Color(), mist: new THREE.Color(),
+    leafA: new THREE.Color(), leafB: new THREE.Color(), fog: new THREE.Color(), moon: new THREE.Color(),
+  };
+  private faceBands = new Array<number>(FACE_BANDS.length).fill(0);
+  private mood = 0;
+  private moodFrom = 0;
+  private moodMix = 1;
+  private moodSpeed = 0.4;
+  private beatsInMood = 0;
+  private shriek = 0;
 
   protected setup() {
     const rand = rng(1414);
+    this.applyMood(0.5);
+    const col = this.col;
     this.scene.fog = new THREE.FogExp2(FOG_COLOR, 0.045);
 
     this.sky = fullscreenQuad(
       /* glsl */ `
       uniform float time, aspect, red;
+      uniform vec3 fogb, mistc;
       varying vec2 vUv;
       ${GLSL_NOISE}
       void main() {
         vec2 p = (vUv - 0.5) * vec2(aspect, 1.0);
-        vec3 fogc = mix(${glslColor(FOG_COLOR)}, vec3(0.05, 0.004, 0.006), red * 0.6);
-        vec3 col = mix(fogc, vec3(0.003, 0.003, 0.01), smoothstep(-0.05, 0.5, p.y));
+        vec3 fogc = mix(fogb, vec3(0.05, 0.004, 0.006), red * 0.6);
+        vec3 col = mix(fogc, fogb * 0.15, smoothstep(-0.05, 0.5, p.y));
         float clouds = fbm(vec3(p * vec2(1.6, 3.0) + vec2(time * 0.01, 0.0), time * 0.02));
-        col += mix(vec3(0.03, 0.035, 0.07), vec3(0.08, 0.0, 0.01), red) * smoothstep(0.0, 0.8, clouds) * smoothstep(0.0, 0.4, p.y);
+        col += mix(mistc * 0.22, vec3(0.08, 0.0, 0.01), red) * smoothstep(0.0, 0.8, clouds) * smoothstep(0.0, 0.4, p.y);
         gl_FragColor = vec4(col, 1.0);
       }`,
-      { time: { value: 0 }, aspect: { value: 1 }, red: { value: 0 } },
+      { time: { value: 0 }, aspect: { value: 1 }, red: { value: 0 }, fogb: { value: col.fog }, mistc: { value: col.mist } },
     );
     this.scene.add(this.sky);
 
     this.moon = new THREE.Mesh(
       new THREE.PlaneGeometry(1, 1),
       new THREE.ShaderMaterial({
-        uniforms: { red: { value: 0 } },
+        uniforms: { red: { value: 0 }, moonc: { value: col.moon } },
         transparent: true,
         depthWrite: false,
         vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
         fragmentShader: /* glsl */ `
           uniform float red;
+          uniform vec3 moonc;
           varying vec2 vUv;
           ${GLSL_NOISE}
           void main() {
@@ -175,7 +201,7 @@ export class HauntedForestVisual extends Visual {
             float r = length(p);
             float disc = smoothstep(0.36, 0.35, r);
             float craters = fbm(vec3(p * 4.0, 5.0)) * 0.5 + 0.5;
-            vec3 mc = mix(vec3(0.75, 0.8, 1.0), vec3(1.0, 0.12, 0.06), red);
+            vec3 mc = mix(moonc, vec3(1.0, 0.12, 0.06), red);
             vec3 col = mc * (0.5 + 0.5 * craters) * disc * 0.9;
             float halo = exp(-max(r - 0.35, 0.0) * 6.0) * 0.35;
             col += mc * halo * 0.5 * (1.0 - disc);
@@ -292,7 +318,10 @@ export class HauntedForestVisual extends Visual {
     this.faces = new THREE.InstancedMesh(
       fg,
       new THREE.ShaderMaterial({
-        uniforms: { uTime: { value: 0 }, uGlow: { value: 1 }, uOpen: { value: 0.3 }, uRed: { value: 0 }, uFog: { value: 0.045 } },
+        uniforms: {
+          uTime: { value: 0 }, uGlow: { value: 1 }, uOpen: { value: 0.3 }, uRed: { value: 0 }, uFog: { value: 0.045 },
+          uHotA: { value: col.faceA }, uHotB: { value: col.faceB }, uBand: { value: this.faceBands }, uShriek: { value: 0 }, uShriekSeed: { value: 0 },
+        },
         transparent: true,
         depthWrite: false,
         vertexShader: /* glsl */ `
@@ -308,14 +337,22 @@ export class HauntedForestVisual extends Visual {
             gl_Position = projectionMatrix * viewMatrix * w;
           }`,
         fragmentShader: /* glsl */ `
-          uniform float uTime, uGlow, uOpen, uRed, uFog;
+          uniform float uTime, uGlow, uOpen, uRed, uFog, uShriek, uShriekSeed;
+          uniform float uBand[${FACE_BANDS.length}];
+          uniform vec3 uHotA, uHotB;
           varying vec2 vUv;
           varying float vSeed;
           varying float vDist;
           void main() {
             vec2 p = vUv - 0.5;
-            float blink = step(0.05, fract(uTime * 0.11 + vSeed * 7.3));
-            float open = clamp(uOpen * (0.7 + 0.3 * sin(uTime * 0.9 + vSeed * 20.0)) * blink, 0.0, 1.0);
+            // each face sings along to its own slice of the spectrum
+            int bi = int(clamp(vSeed, 0.0, 0.999) * ${FACE_BANDS.length}.0);
+            float band = 0.0;
+            for (int k = 0; k < ${FACE_BANDS.length}; k++) if (k == bi) band = uBand[k];
+            // snares/claps: a random few faces shriek, mouths snapping wide, eyes flaring white-hot
+            float sh = uShriek * step(fract(vSeed * 13.7 + uShriekSeed * 0.618), 0.4);
+            float blink = max(step(0.05, fract(uTime * 0.11 + vSeed * 7.3)), sh);
+            float open = clamp(uOpen * (0.7 + 0.3 * sin(uTime * 0.9 + vSeed * 20.0)) * blink + sh * 0.8, 0.0, 1.0);
             open = max(open, uRed);
             // hollow, drooping eye sockets
             vec2 qL = p - vec2(-0.2, 0.18);
@@ -333,9 +370,10 @@ export class HauntedForestVisual extends Visual {
             float rim = smoothstep(1.8, 1.0, d);
             float eyes = smoothstep(1.0, 0.3, dE);
             float flick = 0.75 + 0.25 * sin(uTime * 13.0 + vSeed * 40.0) * sin(uTime * 7.3 + vSeed * 9.0);
-            vec3 hot = mix(${glslColor(PALETTE.candle)}, ${glslColor(PALETTE.ember)}, 0.35 + 0.4 * length(p));
+            vec3 hot = mix(uHotA, uHotB, 0.35 + 0.4 * length(p));
             hot = mix(hot, vec3(1.0, 0.05, 0.02), uRed);
-            vec3 col = hot * uGlow * flick * (0.8 + 0.8 * eyes + 0.5 * smoothstep(1.0, 0.0, d));
+            hot = mix(hot, vec3(1.0, 0.95, 0.85), sh * eyes * 0.55);
+            vec3 col = hot * uGlow * flick * (0.55 + band * 0.9 + sh * 1.5) * (0.8 + 0.8 * eyes + 0.5 * smoothstep(1.0, 0.0, d));
             float fogF = exp(-pow(uFog * vDist * 0.75, 2.0));
             float a = max(hole, rim * 0.85) * fogF;
             gl_FragColor = vec4(col * hole, a);
@@ -357,7 +395,7 @@ export class HauntedForestVisual extends Visual {
     // Ground mist
     for (let i = 0; i < 2; i++) {
       const mat = new THREE.ShaderMaterial({
-        uniforms: { time: { value: 0 }, density: { value: 0.3 }, red: { value: 0 }, seed: { value: i * 3.7 } },
+        uniforms: { time: { value: 0 }, density: { value: 0.3 }, red: { value: 0 }, seed: { value: i * 3.7 }, mistc: { value: col.mist } },
         transparent: true,
         depthWrite: false,
         vertexShader: /* glsl */ `
@@ -369,6 +407,7 @@ export class HauntedForestVisual extends Visual {
           }`,
         fragmentShader: /* glsl */ `
           uniform float time, density, red, seed;
+          uniform vec3 mistc;
           varying vec3 vWorld;
           ${GLSL_NOISE}
           void main() {
@@ -376,7 +415,7 @@ export class HauntedForestVisual extends Visual {
             float a = smoothstep(-0.25, 0.8, n) * density;
             float dist = length(vWorld.xz - cameraPosition.xz);
             a *= smoothstep(1.0, 5.0, dist) * (1.0 - smoothstep(30.0, 60.0, dist));
-            vec3 col = mix(vec3(0.16, 0.17, 0.3), vec3(0.22, 0.03, 0.04), red);
+            vec3 col = mix(mistc, vec3(0.22, 0.03, 0.04), red);
             gl_FragColor = vec4(col, a);
           }`,
       });
@@ -401,32 +440,41 @@ export class HauntedForestVisual extends Visual {
     this.leaves = new THREE.Points(
       lg,
       new THREE.ShaderMaterial({
-        uniforms: { uTime: { value: 0 }, uSparkle: { value: 0 }, uRed: { value: 0 }, uScale: { value: 400 } },
+        uniforms: {
+          uTime: { value: 0 }, uSparkle: { value: 0 }, uRed: { value: 0 }, uScale: { value: 400 },
+          uLeafA: { value: col.leafA }, uLeafB: { value: col.leafB }, uHat: { value: 0 }, uHatSeed: { value: 0 },
+        },
         transparent: true,
         depthWrite: false,
         blending: THREE.AdditiveBlending,
         vertexShader: /* glsl */ `
-          uniform float uTime, uSparkle, uScale;
+          uniform float uTime, uSparkle, uScale, uHat, uHatSeed;
           attribute float aPh;
           varying float vB;
           varying float vPh;
+          varying float vGlint;
           void main() {
             vPh = aPh;
             vec4 mv = modelViewMatrix * vec4(position, 1.0);
             float tw = pow(0.5 + 0.5 * sin(uTime * (6.0 + aPh * 10.0) + aPh * 60.0), 6.0);
-            vB = (0.18 + uSparkle * tw * 2.5) * (1.0 - smoothstep(18.0, 38.0, -mv.z));
-            gl_PointSize = uScale * (0.05 + 0.04 * aPh) * (1.0 + uSparkle * tw) / -mv.z;
+            // hi-hats: a fresh random 15% of the leaves catch the light as white glints
+            vGlint = uHat * step(fract(sin(aPh * 917.3 + uHatSeed * 12.9898) * 43758.5453), 0.15) * smoothstep(2.0, 5.0, -mv.z);
+            vB = (0.18 + uSparkle * tw * 2.5 + vGlint * 3.0) * (1.0 - smoothstep(18.0, 38.0, -mv.z));
+            gl_PointSize = uScale * (0.05 + 0.04 * aPh) * (1.0 + uSparkle * tw + vGlint * 0.8) / -mv.z;
             gl_Position = projectionMatrix * mv;
           }`,
         fragmentShader: /* glsl */ `
           uniform float uRed;
+          uniform vec3 uLeafA, uLeafB;
           varying float vB;
           varying float vPh;
+          varying float vGlint;
           void main() {
             float d = length(gl_PointCoord - 0.5);
             float a = smoothstep(0.5, 0.0, d);
-            vec3 c = mix(${glslColor(PALETTE.pumpkin)}, ${glslColor(PALETTE.candle)}, vPh);
+            vec3 c = mix(uLeafA, uLeafB, vPh);
             c = mix(c, vec3(1.0, 0.08, 0.03), uRed * 0.6);
+            c = mix(c, vec3(1.0), min(vGlint, 1.0) * 0.6);
             gl_FragColor = vec4(c * vB * a, 1.0);
           }`,
       }),
@@ -464,10 +512,45 @@ export class HauntedForestVisual extends Visual {
     this.leaves.material.uniforms.uScale.value = h;
   }
 
+  private applyMood(brightness: number) {
+    const m = this.moodMix * this.moodMix * (3 - 2 * this.moodMix);
+    const a = MOODS[this.moodFrom], b = MOODS[this.mood], c = this.col;
+    for (const k of ['faceA', 'faceB', 'wisp', 'mist', 'leafA', 'leafB', 'fog', 'moon'] as const) c[k].copy(a[k]).lerp(b[k], m);
+    // brighter, airier music nudges the carved faces' hue and cools the moon
+    const h = (brightness - 0.5) * 0.05;
+    c.faceA.offsetHSL(h, 0, 0);
+    c.faceB.offsetHSL(h, 0, 0);
+    c.moon.lerp(PALETTE.ghost, brightness * 0.3);
+  }
+
+  private updateMood(dt: number, audio: AudioFeatures) {
+    if (audio.beat) this.beatsInMood++;
+    if (audio.drop || this.beatsInMood >= 32) {
+      this.moodFrom = this.mood;
+      this.mood = (this.mood + 1 + (audio.drop ? Math.floor(Math.random() * 2) : 0)) % MOODS.length;
+      this.moodMix = 0;
+      this.moodSpeed = audio.drop ? 2.5 : 0.35;
+      this.beatsInMood = 0;
+    }
+    this.moodMix = Math.min(1, this.moodMix + dt * this.moodSpeed);
+    this.applyMood(audio.brightness);
+  }
+
   update(dt: number, time: number, audio: AudioFeatures) {
     dt = Math.min(dt, 0.05);
     if (audio.drop) this.dropTime = time;
     const sinceDrop = time - this.dropTime;
+    this.updateMood(dt, audio);
+    const fu = this.faces.material.uniforms;
+    if (audio.midHit) {
+      this.shriek = 1;
+      fu.uShriekSeed.value = audio.midHitCount % 97;
+    }
+    this.shriek = Math.max(0, this.shriek - dt * 3);
+    for (let k = 0; k < FACE_BANDS.length; k++) {
+      const v = audio.bands[FACE_BANDS[k]] ?? 0;
+      this.faceBands[k] = damp(this.faceBands[k], v, v > this.faceBands[k] ? 18 : 5, dt);
+    }
     this.red = damp(this.red, sinceDrop < 3 ? 1 : 0, sinceDrop < 3 ? 12 : 0.7, dt);
     this.glow = damp(this.glow, 1.2 + audio.mid * 5 + audio.beatPulse * 3 + this.red * 4, 8, dt);
     this.open = damp(this.open, 0.25 + audio.mid * 0.7 + audio.beatPulse * 0.25, 6, dt);
@@ -477,10 +560,10 @@ export class HauntedForestVisual extends Visual {
     tu.uTime.value = time;
     tu.uReach.value = this.reach;
     tu.uSway.value = 0.15 + audio.bass * 0.5;
-    tu.uTwitch.value = audio.beatPulse * 0.06 + this.red * 0.02;
+    tu.uTwitch.value = audio.beatPulse * 0.06 + audio.midPulse * 0.035 + this.red * 0.02;
 
-    const fu = this.faces.material.uniforms;
     fu.uTime.value = time;
+    fu.uShriek.value = this.shriek;
     fu.uGlow.value = this.glow;
     fu.uOpen.value = this.open;
     fu.uRed.value = this.red;
@@ -497,7 +580,7 @@ export class HauntedForestVisual extends Visual {
     const fogD = 0.045 - audio.level * 0.008;
     const fog = this.scene.fog as THREE.FogExp2;
     fog.density = fogD;
-    fog.color.copy(FOG_COLOR).lerp(this.redFog, this.red * 0.6);
+    fog.color.copy(this.col.fog).lerp(this.redFog, this.red * 0.6);
     fu.uFog.value = fogD;
 
     this.sky.material.uniforms.time.value = time;
@@ -506,7 +589,9 @@ export class HauntedForestVisual extends Visual {
     this.moon.position.set(cam.position.x + 10, 34, camZ - 160);
     this.moon.lookAt(cam.position);
     this.hemi.intensity = 0.45 + audio.beatPulse * 0.15;
+    this.hemi.color.copy(this.col.mist).multiplyScalar(0.25);
     this.moonLight.intensity = 1 + this.red * 0.5;
+    this.moonLight.color.copy(this.col.moon);
     this.redLight.intensity = this.red * 16;
     this.redLight.position.set(pathX(camZ - 10), 4, camZ - 10);
 
@@ -536,6 +621,8 @@ export class HauntedForestVisual extends Visual {
     lu.uTime.value = time;
     lu.uSparkle.value = audio.treble * 1.5 + audio.beatPulse * 0.3;
     lu.uRed.value = this.red;
+    lu.uHat.value = audio.treblePulse;
+    if (audio.trebleHit) lu.uHatSeed.value = audio.trebleHitCount % 113;
 
     const wp = this.wisps.geometry.attributes.position.array as Float32Array;
     for (let i = 0; i < WISPS; i++) {
@@ -548,10 +635,12 @@ export class HauntedForestVisual extends Visual {
       wp[i * 3 + 2] = z;
       if (i < this.wispLights.length) {
         this.wispLights[i].position.set(x, y, z);
-        this.wispLights[i].intensity = 2 + audio.treble * 4;
+        this.wispLights[i].intensity = 2 + audio.treble * 3 + audio.treblePulse * 2;
+        this.wispLights[i].color.copy(this.col.wisp);
       }
     }
     this.wisps.geometry.attributes.position.needsUpdate = true;
-    this.wisps.material.size = 0.7 + audio.treble * 0.6 + audio.beatPulse * 0.2;
+    this.wisps.material.size = 0.7 + audio.treble * 0.6 + audio.treblePulse * 0.25 + audio.beatPulse * 0.2;
+    this.wisps.material.color.copy(this.col.wisp).multiplyScalar(1.8);
   }
 }

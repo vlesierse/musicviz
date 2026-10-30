@@ -19,6 +19,17 @@ const P = {
 } as const;
 const CH = 19;
 const DOWN = new THREE.Vector3(0, -1, 0);
+const DUST = 420;
+
+/** Bone glow schemes [rim, eyes]; cycle every 32 beats and on drops. */
+const SCHEMES: Array<[THREE.Color, THREE.Color]> = [
+  [PALETTE.toxic.clone(), new THREE.Color(0.3, 1, 0.45)],
+  [new THREE.Color(0x9b30ff), new THREE.Color(0xff2f9a)],
+  [new THREE.Color(0x00e0c0), new THREE.Color(0x30b8ff)],
+  [new THREE.Color(0xff7a00), new THREE.Color(0xffd040)],
+  [new THREE.Color(0xff2fb0), new THREE.Color(0x30d8ff)],
+  [new THREE.Color(0x4b6bff), new THREE.Color(0x9bff3a)],
+];
 
 function capsule(r: number, len: number) {
   return new THREE.CapsuleGeometry(r, len, 3, 8).translate(0, -len / 2, 0);
@@ -82,7 +93,22 @@ export class SkeletonDanceVisual extends Visual {
   private rigs: Rig[] = [];
   private boneMat!: THREE.MeshStandardMaterial;
   private rimUniform = { value: new THREE.Color() };
-  private eyeMat!: THREE.MeshBasicMaterial;
+  private eyeMats: THREE.MeshBasicMaterial[] = [];
+  private rings: THREE.Mesh<THREE.RingGeometry, THREE.MeshBasicMaterial>[] = [];
+  private twitch = new Float32Array(COUNT);
+  private twitchSide = new Float32Array(COUNT);
+  private ringAge = new Float32Array(COUNT).fill(10);
+  private eyeLvl = new Float32Array(COUNT);
+  private jawLvl = new Float32Array(COUNT);
+  private dust!: THREE.Points<THREE.BufferGeometry, THREE.ShaderMaterial>;
+  private scheme = 0;
+  private schemeFrom = 0;
+  private schemeMix = 1;
+  private schemeSpeed = 0.4;
+  private beatsInScheme = 0;
+  private rimCol = new THREE.Color();
+  private eyeCol = new THREE.Color();
+  private glint = 0;
   private spots: THREE.SpotLight[] = [];
   private spotTargets: THREE.Color[] = [];
   private cones: THREE.Mesh<THREE.ConeGeometry, THREE.ShaderMaterial>[] = [];
@@ -119,7 +145,7 @@ export class SkeletonDanceVisual extends Visual {
           totalEmissiveRadiance += uRim * pow(rimF, 2.5);`,
         );
     };
-    this.eyeMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.4, 3, 0.8) });
+    for (let i = 0; i < COUNT; i++) this.eyeMats.push(new THREE.MeshBasicMaterial({ color: new THREE.Color(0.4, 3, 0.8) }));
     const socketMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
 
     // Shared bone geometries
@@ -167,6 +193,7 @@ export class SkeletonDanceVisual extends Visual {
     const thighGeo = capsule(0.032, 0.38);
     const shinGeo = mergeGeometries([capsule(0.026, 0.38), capsule(0.014, 0.36).translate(0.035, -0.01, 0)])!;
     const footGeo = new THREE.BoxGeometry(0.08, 0.04, 0.2).translate(0, -0.02, 0.06);
+    const ringGeo = new THREE.RingGeometry(0.82, 1, 48).rotateX(-Math.PI / 2);
 
     const mk = (g: THREE.BufferGeometry, parent: THREE.Object3D, m: THREE.Material = this.boneMat) => {
       const mesh = new THREE.Mesh(g, m);
@@ -198,7 +225,7 @@ export class SkeletonDanceVisual extends Visual {
         const so = mk(socketGeo, neck, socketMat);
         so.position.set(side * 0.045, 0.15, 0.105);
         so.scale.set(1, 0.9, 0.5);
-        const e = mk(eyeGeo, neck, this.eyeMat);
+        const e = mk(eyeGeo, neck, this.eyeMats[i]);
         e.position.set(side * 0.045, 0.15, 0.115);
       }
       const jaw = grp(neck, 0, 0.04, 0.0);
@@ -242,6 +269,16 @@ export class SkeletonDanceVisual extends Visual {
       );
       shadow.position.set(baseX, STAGE_Y + 0.005, baseZ);
       this.scene.add(shadow);
+
+      // shockwave ring on the stage floor for snare/clap twitches
+      const ring = new THREE.Mesh(
+        ringGeo,
+        new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending }),
+      );
+      ring.position.set(baseX, STAGE_Y + 0.012, baseZ);
+      ring.visible = false;
+      this.rings.push(ring);
+      this.scene.add(ring);
     }
 
     // Crypt: stone wall, pillars, floor, stage
@@ -414,6 +451,64 @@ export class SkeletonDanceVisual extends Visual {
       this.scene.add(plane);
     }
 
+    // Dust motes hanging in the spotlights; hi-hats make random ones glint
+    const dPos = new Float32Array(DUST * 3);
+    const dRand = new Float32Array(DUST);
+    for (let i = 0; i < DUST; i++) {
+      dPos[i * 3] = (Math.random() - 0.5) * 13;
+      dPos[i * 3 + 1] = STAGE_Y + 0.2 + Math.random() * 5.5;
+      dPos[i * 3 + 2] = -1.8 + Math.random() * 4.2;
+      dRand[i] = Math.random();
+    }
+    const dg = new THREE.BufferGeometry();
+    dg.setAttribute('position', new THREE.BufferAttribute(dPos, 3));
+    dg.setAttribute('aRand', new THREE.BufferAttribute(dRand, 1));
+    this.dust = new THREE.Points(
+      dg,
+      new THREE.ShaderMaterial({
+        uniforms: {
+          uTime: { value: 0 },
+          uHit: { value: 0 },
+          uSeed: { value: 0 },
+          uTreble: { value: 0 },
+          uScale: { value: 400 },
+          uColor: { value: new THREE.Color() },
+        },
+        vertexShader: /* glsl */ `
+          uniform float uTime, uHit, uSeed, uTreble, uScale;
+          attribute float aRand;
+          varying float vI;
+          float h1(float n) { return fract(sin(n) * 43758.5453); }
+          void main() {
+            vec3 p = position;
+            p.y = ${(STAGE_Y + 0.2).toFixed(2)} + mod(position.y - ${(STAGE_Y + 0.2).toFixed(2)} + uTime * (0.04 + aRand * 0.06), 5.5);
+            p.x += sin(uTime * 0.3 + aRand * 40.0) * 0.25;
+            p.z += cos(uTime * 0.23 + aRand * 31.0) * 0.2;
+            float lit = step(0.84, h1(aRand * 917.3 + uSeed * 13.17));
+            float tw = 0.5 + 0.5 * sin(uTime * (3.0 + aRand * 5.0) + aRand * 60.0);
+            vI = 0.22 + 0.25 * tw * uTreble + lit * uHit * 2.2;
+            vec4 mv = modelViewMatrix * vec4(p, 1.0);
+            gl_PointSize = uScale * (0.03 + 0.07 * lit * uHit) / -mv.z;
+            gl_Position = projectionMatrix * mv;
+          }`,
+        fragmentShader: /* glsl */ `
+          uniform vec3 uColor;
+          varying float vI;
+          void main() {
+            vec2 q = gl_PointCoord * 2.0 - 1.0;
+            float r2 = dot(q, q);
+            if (r2 > 1.0) discard;
+            float star = exp(-r2 * 9.0) + 0.5 * (exp(-abs(q.x) * 18.0) + exp(-abs(q.y) * 18.0)) * (1.0 - r2);
+            gl_FragColor = vec4(uColor * star * vI, 1.0);
+          }`,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      }),
+    );
+    this.dust.frustumCulled = false;
+    this.scene.add(this.dust);
+
     const cam = this.camera as THREE.PerspectiveCamera;
     cam.fov = 45;
     cam.far = 200;
@@ -571,8 +666,26 @@ export class SkeletonDanceVisual extends Visual {
     }
 
     const jawOpen = 0.06 + audio.mid * 0.5;
+    // snare/clap: one or two skeletons snap their head and shrug, with a shockwave ring under their feet
+    if (audio.midHit) {
+      const n = audio.mid > 0.55 ? 2 : 1;
+      for (let k = 0; k < n; k++) {
+        const i = Math.floor(Math.random() * COUNT);
+        this.twitch[i] = 1;
+        this.twitchSide[i] = Math.random() < 0.5 ? -1 : 1;
+        this.ringAge[i] = 0;
+      }
+    }
+    const twDecay = Math.exp(-4.5 * dt);
     for (let i = 0; i < this.rigs.length; i++) {
       const r = this.rigs[i];
+      this.twitch[i] *= twDecay;
+      const tw = this.twitch[i];
+      const tws = tw * this.twitchSide[i];
+      // each skeleton "sings" its own slice of the spectrum
+      const band = audio.bands[6 + i * 8] * 0.6 + audio.bands[8 + i * 8] * 0.4;
+      this.jawLvl[i] = damp(this.jawLvl[i], band, band > this.jawLvl[i] ? 25 : 8, dt);
+      this.eyeLvl[i] = damp(this.eyeLvl[i], band, 10, dt);
       this.computePose(r.target, b - i * 0.01, move, this.amp, i, sinceDrop);
       const lambda = 22;
       for (let k = 0; k < CH; k++) r.pose[k] = damp(r.pose[k], r.target[k], lambda, dt);
@@ -580,27 +693,60 @@ export class SkeletonDanceVisual extends Visual {
       r.root.position.set(r.baseX + p[P.x], STAGE_Y + p[P.y] + jumpY, r.baseZ);
       r.root.rotation.y = p[P.rotY] + spin * (i % 2 ? -1 : 1);
       r.hips.rotation.set(0, 0, p[P.pelvisZ]);
-      r.spine.rotation.set(p[P.spineX], p[P.spineY], p[P.spineZ] - p[P.pelvisZ]);
-      r.neck.rotation.set(p[P.neckX], 0, p[P.neckZ]);
-      r.jaw.rotation.x = jawOpen * (0.5 + 0.5 * Math.sin(time * 26 + r.seed * 3)) + audio.beatPulse * 0.18;
-      r.lSh.rotation.set(-p[P.lFwd], 0, p[P.lOut]);
-      r.rSh.rotation.set(-p[P.rFwd], 0, -p[P.rOut]);
-      r.lEl.rotation.set(-p[P.lEl], 0, 0);
-      r.rEl.rotation.set(-p[P.rEl], 0, 0);
+      r.spine.rotation.set(p[P.spineX], p[P.spineY], p[P.spineZ] - p[P.pelvisZ] + tws * 0.14);
+      r.neck.rotation.set(p[P.neckX] - tw * 0.3, tws * 0.35, p[P.neckZ] + tws * 0.5);
+      r.jaw.rotation.x =
+        0.03 + this.jawLvl[i] * 0.42 + jawOpen * 0.25 * (0.5 + 0.5 * Math.sin(time * 26 + r.seed * 3)) + audio.beatPulse * 0.12 + tw * 0.4;
+      r.lSh.rotation.set(-p[P.lFwd], 0, p[P.lOut] + tw * 0.55);
+      r.rSh.rotation.set(-p[P.rFwd], 0, -p[P.rOut] - tw * 0.55);
+      r.lEl.rotation.set(-p[P.lEl] - tw * 0.5, 0, 0);
+      r.rEl.rotation.set(-p[P.rEl] - tw * 0.5, 0, 0);
       r.lHip.rotation.set(-p[P.lHip], 0, -p[P.pelvisZ]);
       r.rHip.rotation.set(-p[P.rHip], 0, -p[P.pelvisZ]);
       r.lKnee.rotation.x = p[P.lKnee];
       r.rKnee.rotation.x = p[P.rKnee];
     }
 
-    // Glows
+    // Glow scheme: cycles every 32 beats, snaps (fast crossfade) on drops
+    if (audio.beat) this.beatsInScheme++;
+    if (audio.drop || this.beatsInScheme >= 32) {
+      this.schemeFrom = this.scheme;
+      this.scheme = (this.scheme + 1 + (audio.drop ? Math.floor(Math.random() * 2) : 0)) % SCHEMES.length;
+      this.schemeMix = 0;
+      this.schemeSpeed = audio.drop ? 2.5 : 0.35;
+      this.beatsInScheme = 0;
+    }
+    this.schemeMix = Math.min(1, this.schemeMix + dt * this.schemeSpeed);
+    const sm = this.schemeMix * this.schemeMix * (3 - 2 * this.schemeMix);
+    this.rimCol.copy(SCHEMES[this.schemeFrom][0]).lerp(SCHEMES[this.scheme][0], sm);
+    this.eyeCol.copy(SCHEMES[this.schemeFrom][1]).lerp(SCHEMES[this.scheme][1], sm);
+    // brighter music pulls the bone glow toward the eye colour
+    this.rimCol.lerp(this.eyeCol, audio.brightness * 0.35);
+
     const red = Math.min(1, dropEnv * 1.3);
-    this.rimUniform.value.copy(PALETTE.toxic).multiplyScalar(0.08 + audio.beatPulse * 0.25 + audio.mid * 0.15);
+    this.rimUniform.value.copy(this.rimCol).multiplyScalar(0.08 + audio.beatPulse * 0.25 + audio.mid * 0.1 + audio.midPulse * 0.12);
     this.rimUniform.value.lerp(this.tmpColor.setRGB(0.9, 0.05, 0.05), red * 0.8);
-    const eye = 1.6 + audio.mid * 4 + audio.beatPulse * 2 + dropEnv * 3;
-    this.eyeMat.color.setRGB(0.25 * eye, eye, 0.5 * eye).lerp(this.tmpColor.setRGB(eye * 1.2, 0.1, 0.05), red);
+    for (let i = 0; i < COUNT; i++) {
+      const tw = this.twitch[i];
+      const eye = 1.2 + this.eyeLvl[i] * 3.2 + audio.beatPulse * 1.5 + dropEnv * 3 + tw * 4;
+      const m = this.eyeMats[i].color;
+      m.copy(this.eyeCol).multiplyScalar(eye);
+      // snare twitch flashes the eyes toward the bone-glow colour
+      m.lerp(this.tmpColor.copy(this.rimCol).multiplyScalar(eye * 1.2), tw * 0.6);
+      m.lerp(this.tmpColor.setRGB(eye * 1.2, 0.1, 0.05), red);
+      // shockwave rings (~0.7 s)
+      const ring = this.rings[i];
+      const age = (this.ringAge[i] += dt);
+      ring.visible = age < 0.7;
+      if (ring.visible) {
+        const k = age / 0.7;
+        ring.scale.setScalar(0.25 + 1.3 * Math.sqrt(k));
+        ring.material.opacity = (1 - k) * (1 - k) * 0.8;
+        ring.material.color.copy(this.rimCol).lerp(this.eyeCol, 0.4);
+      }
+    }
     this.backLight.intensity = 1.0 + audio.bass * 1.2 + dropEnv * 2;
-    this.backLight.color.setRGB(0.36 + red * 0.6, 1 - red * 0.8, 0.6 - red * 0.5);
+    this.backLight.color.copy(this.rimCol).lerp(this.tmpColor.setRGB(1, 0.2, 0.1), red * 0.8);
 
     // Spotlights change colour on beats
     if (audio.beat) {
@@ -613,10 +759,13 @@ export class SkeletonDanceVisual extends Visual {
       s.color.lerp(this.spotTargets[k], 1 - Math.exp(-12 * dt));
       const sweep = Math.sin(time * (0.5 + k * 0.13) + k * 2) * (1.6 + dropEnv * 1.5);
       s.target.position.x = (k - 1) * 3 + sweep;
-      s.intensity = 60 + audio.bass * 70 + audio.beatPulse * 50 + dropEnv * 60;
+      // left spot rides the lows, centre the mids, right the highs
+      const sec = k === 0 ? audio.bass : k === 1 ? audio.mid : audio.treble;
+      const hit = k === 0 ? audio.beatPulse : k === 1 ? audio.midPulse : audio.treblePulse;
+      s.intensity = 50 + audio.bass * 40 + sec * 50 + hit * 45 + dropEnv * 60;
       const cone = this.cones[k];
       cone.material.uniforms.uColor.value.copy(s.color);
-      cone.material.uniforms.uInt.value = 0.1 + audio.beatPulse * 0.08 + audio.bass * 0.06;
+      cone.material.uniforms.uInt.value = 0.09 + audio.beatPulse * 0.05 + sec * 0.06 + hit * 0.05;
       const dx = s.target.position.x - s.position.x;
       const dy = STAGE_Y - s.position.y;
       const dz = s.target.position.z - s.position.z;
@@ -627,12 +776,24 @@ export class SkeletonDanceVisual extends Visual {
     const smokeCol = this.tmpColor.copy(this.spots[0].color).add(this.spots[1].color).add(this.spots[2].color).multiplyScalar(0.12).addScalar(0.05);
     for (const s of this.smoke) {
       s.material.uniforms.time.value = time;
-      s.material.uniforms.density.value = 0.22 + audio.bass * 0.25 + dropEnv * 0.25;
+      s.material.uniforms.density.value = 0.2 + audio.bass * 0.2 + audio.mid * 0.12 + dropEnv * 0.25;
       s.material.uniforms.color.value.copy(smokeCol);
     }
     this.candles.material.size = 0.5 + 0.12 * Math.sin(time * 13) * Math.sin(time * 5.7) + audio.treble * 0.3;
     this.hemi.intensity = 0.3 + dropEnv * 0.3;
-    for (let k = 0; k < this.uplights.length; k++) this.uplights[k].intensity = 8 + (k ? audio.treble : audio.bass) * 14 + audio.beatPulse * 6;
+    for (let k = 0; k < this.uplights.length; k++) {
+      const up = this.uplights[k];
+      up.intensity = 8 + (k ? audio.treble : audio.bass) * 14 + (k ? audio.treblePulse : audio.beatPulse) * 6;
+      up.color.copy(k ? this.eyeCol : this.rimCol);
+    }
+    const du = this.dust.material.uniforms;
+    du.uTime.value = time;
+    if (audio.trebleHit) this.glint = 1;
+    this.glint *= Math.exp(-4.5 * dt);
+    du.uHit.value = this.glint;
+    du.uSeed.value = audio.trebleHitCount % 1000;
+    du.uTreble.value = audio.treble;
+    du.uColor.value.copy(this.eyeCol).lerp(PALETTE.moon, 0.5);
 
     // Camera drift
     const cam = this.camera as THREE.PerspectiveCamera;
@@ -643,6 +804,12 @@ export class SkeletonDanceVisual extends Visual {
       7.4 + Math.sin(time * 0.07) * 0.8 - dropEnv * 0.8,
     );
     cam.lookAt(Math.sin(time * 0.09) * 0.6, 1.5, 0);
+  }
+
+  resize(w: number, h: number) {
+    super.resize(w, h);
+    if (!this.dust) return;
+    this.dust.material.uniforms.uScale.value = h * 0.9;
   }
 
   private tmpVec = new THREE.Vector3();
